@@ -1,0 +1,118 @@
+from datetime import datetime, timedelta
+
+# Rule identifiers
+MISSING_LOGTIME = "missing_logtime"
+MISSING_DESCRIPTION = "missing_description"
+PRE_VERSION_REMINDER = "pre_version_reminder"
+POST_VERSION_ALERT = "post_version_alert"
+
+
+def evaluate_missing_logtime(task, ci_testing_wait_minutes):
+    status_raw = task.get('status')
+    status_norm = (status_raw or "").strip().upper()
+    print(f"[Rules] evaluate_missing_logtime: key={task.get('key')} status={status_raw} (norm={status_norm}) has_worklog={task.get('has_worklog')} last_status_changed_at={task.get('last_status_changed_at')} wait={ci_testing_wait_minutes}m")
+    # Chấp nhận các biến thể như "READY CI TESTING", "IN CI TESTING"...
+    if "READY CI TESTING" not in status_norm:
+        print("[Rules] -> skip: status does not contain 'CI TESTING'")
+        return None
+    if task.get("has_worklog"):
+        print("[Rules] -> skip: already has worklog")
+        return None
+    changed_at_str = task.get("last_status_changed_at")
+    if not changed_at_str:
+        print("[Rules] -> hit: no last_status_changed_at")
+        return MISSING_LOGTIME
+    try:
+        changed_at = datetime.strptime(changed_at_str, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        # Fallback: try without tz
+        try:
+            changed_at = datetime.strptime(changed_at_str, "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            print("[Rules] -> hit: cannot parse last_status_changed_at")
+            return MISSING_LOGTIME
+    if datetime.now(changed_at.tzinfo) - changed_at >= timedelta(minutes=ci_testing_wait_minutes):
+        print("[Rules] -> hit: exceeded wait window")
+        return MISSING_LOGTIME
+    print("[Rules] -> no hit")
+    return None
+
+
+def evaluate_missing_description(task):
+    description = task.get("description")
+    print(f"[Rules] evaluate_missing_description: key={task.get('key')} has_desc={bool(description and str(description).strip())}")
+    if description is None or str(description).strip() == "":
+        print("[Rules] -> hit: missing description")
+        return MISSING_DESCRIPTION
+    print("[Rules] -> no hit")
+    return None
+
+
+def evaluate_pre_version_reminder(task, pre_version_days):
+    # Need fixVersion dates and UAT flag
+    fix_versions = task.get("fixVersions") or []
+    fv_dates = task.get("fixVersion_dates") or {}
+    print(f"[Rules] evaluate_pre_version_reminder: key={task.get('key')} fv_count={len(fix_versions)} is_uat_done={task.get('is_uat_done')} pre_days={pre_version_days}")
+    if not fix_versions:
+        print("[Rules] -> skip: no fixVersions")
+        return None
+    if task.get("is_uat_done"):
+        print("[Rules] -> skip: UAT done")
+        return None
+    now = datetime.now()
+    for fv in fix_versions:
+        name = fv.get("name") if isinstance(fv, dict) else fv
+        date_str = fv_dates.get(name)
+        if not date_str:
+            print(f"[Rules]   skip fv '{name}': no releaseDate")
+            continue
+        try:
+            release_date = datetime.fromisoformat(date_str)
+        except Exception:
+            print(f"[Rules]   skip fv '{name}': invalid releaseDate={date_str}")
+            continue
+        days_until = (release_date - now).days
+        if 0 <= days_until <= pre_version_days:
+            print(f"[Rules] -> hit: fv={name} days_until={days_until}")
+            return {
+                "code": PRE_VERSION_REMINDER,
+                "fv_name": name,
+                "days": days_until,
+            }
+    print("[Rules] -> no hit")
+    return None
+
+
+def evaluate_post_version_alert(task):
+    # After release date and not in production
+    fix_versions = task.get("fixVersions") or []
+    fv_dates = task.get("fixVersion_dates") or {}
+    print(f"[Rules] evaluate_post_version_alert: key={task.get('key')} fv_count={len(fix_versions)} is_production={task.get('is_production')}")
+    if not fix_versions:
+        print("[Rules] -> skip: no fixVersions")
+        return None
+    if task.get("is_production"):
+        print("[Rules] -> skip: already in production")
+        return None
+    now = datetime.now()
+    for fv in fix_versions:
+        name = fv.get("name") if isinstance(fv, dict) else fv
+        date_str = fv_dates.get(name)
+        if not date_str:
+            print(f"[Rules]   skip fv '{name}': no releaseDate")
+            continue
+        try:
+            release_date = datetime.fromisoformat(date_str)
+        except Exception:
+            print(f"[Rules]   skip fv '{name}': invalid releaseDate={date_str}")
+            continue
+        if now > release_date:
+            print(f"[Rules] -> hit: past release date for {name}")
+            return {
+                "code": POST_VERSION_ALERT,
+                "fv_name": name,
+                "release_date": release_date.date().isoformat(),
+            }
+    print("[Rules] -> no hit")
+    return None
+
