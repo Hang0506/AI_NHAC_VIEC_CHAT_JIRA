@@ -15,10 +15,12 @@ from rules import (
      evaluate_missing_description,
      evaluate_pre_version_reminder,
      evaluate_post_version_alert,
+     evaluate_assignee_changed,
      MISSING_LOGTIME,
      MISSING_DESCRIPTION,
      PRE_VERSION_REMINDER,
      POST_VERSION_ALERT,
+     ASSIGNEE_CHANGED,
 )
 from chat_api import send_message_fpt
  
@@ -116,6 +118,7 @@ def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: s
      return False
  
 def build_message(task: dict, code: str, data: Optional[dict]) -> str:
+     """Build message for a single rule."""
      url = task.get("task_url")
      if code == MISSING_LOGTIME:
          return f"⚠️ Task {task['key']} ({task['summary']}) đã ở CI Testing một thời gian mà chưa có logtime. Vui lòng logtime: {url}"
@@ -126,7 +129,35 @@ def build_message(task: dict, code: str, data: Optional[dict]) -> str:
          return f"⏰ Task {task['key']} thuộc Fix Version {data['fv_name']} sắp release trong {data['days']} ngày, chưa lên UAT. Vui lòng kiểm tra: {url}"
      if code == POST_VERSION_ALERT and data:
          return f"🚨 Task {task['key']} thuộc Fix Version {data['fv_name']} đã quá hạn release ({data['release_date']}) nhưng chưa lên Production. Kiểm tra gấp: {url}"
+     if code == ASSIGNEE_CHANGED and data:
+         return f"👤 Task {task['key']} ({task['summary']}) vừa được gán cho bạn. Vui lòng kiểm tra: {url}"
      return f"ℹ️ Task {task['key']}: {url}"
+
+def build_combined_message(task: dict, findings: List[Tuple[str, Optional[dict], str]]) -> str:
+     """Build combined message for multiple rules of the same task."""
+     url = task.get("task_url")
+     task_key = task.get('key', '')
+     task_summary = task.get('summary', '')
+     
+     messages = []
+     for code, data, _ in findings:
+         if code == MISSING_LOGTIME:
+             messages.append("⚠️ Đã ở CI Testing một thời gian mà chưa có logtime. Vui lòng logtime.")
+         elif code == MISSING_DESCRIPTION:
+             reporter = task.get("reporter_email") or ""
+             messages.append(f"📝 Chưa có description. Reporter: {reporter}. Vui lòng bổ sung.")
+         elif code == PRE_VERSION_REMINDER and data:
+             messages.append(f"⏰ Thuộc Fix Version {data['fv_name']} sắp release trong {data['days']} ngày, chưa lên UAT. Vui lòng kiểm tra.")
+         elif code == POST_VERSION_ALERT and data:
+             messages.append(f"🚨 Thuộc Fix Version {data['fv_name']} đã quá hạn release ({data['release_date']}) nhưng chưa lên Production. Kiểm tra gấp.")
+         elif code == ASSIGNEE_CHANGED and data:
+             messages.append("👤 Vừa được gán cho bạn.")
+     
+     if messages:
+         combined = f"Task {task_key} ({task_summary}):\n" + "\n".join(f"• {msg}" for msg in messages) + f"\n\nVui lòng kiểm tra: {url}"
+         return combined
+     
+     return f"ℹ️ Task {task_key}: {url}"
  
 def run_once():
     load_dotenv()
@@ -139,7 +170,8 @@ def run_once():
     chat_bot_id = os.getenv("FPT_CHAT_BOT_ID", "")
     schedule_minutes = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "15"))
     employees_file = os.getenv("EMPLOYEES_FILE", "employees.csv")
-    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "FC,FSS,PPFP").split(",")) if p.strip()]
+    #projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "FC,FSS,PPFP").split(",")) if p.strip()]
+    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "PPFP").split(",")) if p.strip()]
     history_path = os.getenv("REMINDER_HISTORY_FILE", "data/reminder_logs.csv")
 
     config_path = os.path.join(os.getcwd(), "rules_config.json")
@@ -147,12 +179,13 @@ def run_once():
     ci_wait = int(config.get("ci_testing_wait_minutes", 5))
     pre_days = int(config.get("pre_version_days", 2))
     resend_after_hours = int(config.get("resend_after_hours", 8))
+    assignee_change_wait = int(config.get("assignee_change_wait_minutes", 5))
     domains_allowed = config.get("domains_allowed", ["FRT"])
 
     logger.info("Starting reminder run")
     logger.debug(f"Jira URL: {jira_url}, user: {jira_user}, auth: {jira_auth_type}")
     logger.debug(f"Projects: {projects}, schedule_minutes: {schedule_minutes}")
-    logger.debug(f"Config -> ci_wait: {ci_wait} min, pre_days: {pre_days}, resend_after_hours: {resend_after_hours}")
+    logger.debug(f"Config -> ci_wait: {ci_wait} min, pre_days: {pre_days}, resend_after_hours: {resend_after_hours}, assignee_change_wait: {assignee_change_wait} min")
     logger.debug(f"Employees file: {employees_file}, history path: {history_path}")
 
     # Prepare services
@@ -200,9 +233,27 @@ def run_once():
             logger.debug(f"Rule hit: POST_VERSION_ALERT for {task.get('key')} -> {r4}")
             findings.append((POST_VERSION_ALERT, r4, task.get("assignee_email")))
 
+        # Check assignee changed - need to get changelog info first
+        # Only check if task was recently updated to avoid unnecessary API calls
+        if task.get("assignee_email"):
+            # Lazy load last_assignee_changed_at only when needed
+            if task.get("last_assignee_changed_at") is None:
+                try:
+                    changed_at = jira.get_last_assignee_change(task.get("key"))
+                    task["last_assignee_changed_at"] = changed_at
+                except Exception as ex:
+                    logger.warning(f"Failed to get last assignee change for {task.get('key')}: {ex}")
+                    task["last_assignee_changed_at"] = None
+            
+            r5 = evaluate_assignee_changed(task, assignee_change_wait)
+            if isinstance(r5, dict):
+                logger.debug(f"Rule hit: ASSIGNEE_CHANGED for {task.get('key')} -> {r5}")
+                findings.append((ASSIGNEE_CHANGED, r5, task.get("assignee_email")))
+
         print(f"[Bot] Findings for {task.get('key')}: {len(findings)}")
 
-        # Build and send messages
+        # Normalize recipients and group findings by recipient
+        recipient_findings = {}  # recipient_email -> list of (code, data, recipient_email)
         for code, data, recipient_email in findings:
             if not recipient_email:
                 recipient_email = task.get("reporter_email")
@@ -210,19 +261,43 @@ def run_once():
                 logger.debug(f"Skip send: no recipient for task {task.get('key')} rule {code}")
                 print(f"[Bot] Skip send {task.get('key')} {code}: no recipient")
                 continue
+            
+            if recipient_email not in recipient_findings:
+                recipient_findings[recipient_email] = []
+            recipient_findings[recipient_email].append((code, data, recipient_email))
 
-            # dedup check
-            if _already_sent(history_rows, task["key"], code, recipient_email, resend_after_hours):
-                print(f"[Bot] Skip send {task.get('key')} {code}: already sent within last {resend_after_hours}h to {recipient_email}")
+        # Send one combined message per recipient
+        for recipient_email, recipient_finding_list in recipient_findings.items():
+            # Check if any rule was already sent (use first rule for dedup check)
+            # Note: We check if ALL rules were sent, if any was sent recently, skip this recipient
+            should_skip = False
+            for code, data, _ in recipient_finding_list:
+                if _already_sent(history_rows, task["key"], code, recipient_email, resend_after_hours):
+                    logger.debug(f"Skip send: rule {code} for task {task.get('key')} already sent within last {resend_after_hours}h to {recipient_email}")
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                print(f"[Bot] Skip send {task.get('key')}: already sent to {recipient_email} within last {resend_after_hours}h")
                 continue
+
+            # Build combined message
+            if len(recipient_finding_list) == 1:
+                # Single rule - use original message format
+                code, data, _ = recipient_finding_list[0]
+                text = build_message(task, code, data)
+                rule_codes = [code]
+            else:
+                # Multiple rules - use combined format
+                text = build_combined_message(task, recipient_finding_list)
+                rule_codes = [code for code, _, _ in recipient_finding_list]
 
             # mapping chat id
             chat_id = _lookup_chat_id(employees_df, recipient_email) or recipient_email
-            text = build_message(task, code, data)
-            print(f"[Bot] Send -> task={task.get('key')} code={code} to={recipient_email} group={chat_id if chat_id and chat_id != recipient_email else None}")
+            print(f"[Bot] Send -> task={task.get('key')} rules={rule_codes} to={recipient_email} group={chat_id if chat_id and chat_id != recipient_email else None}")
 
             # Attempt send: try by email first; if fails, fallback to groupId (from employees.csv chat_id column)
-            logger.info(f"Sending message for {task.get('key')} rule {code} to {recipient_email} (group_id: {chat_id if chat_id and chat_id != recipient_email else None})")
+            logger.info(f"Sending combined message for {task.get('key')} rules {rule_codes} to {recipient_email} (group_id: {chat_id if chat_id and chat_id != recipient_email else None})")
             ok, resp = send_message_fpt(
                 chat_base_url,
                 chat_bot_id,
@@ -233,21 +308,22 @@ def run_once():
             count_attempt += 1
             if ok:
                 count_sent += 1
-                logger.info(f"Sent OK for {task.get('key')} rule {code}")
+                logger.info(f"Sent OK for {task.get('key')} rules {rule_codes} to {recipient_email}")
             else:
-                logger.warning(f"Send FAILED for {task.get('key')} rule {code}")
+                logger.warning(f"Send FAILED for {task.get('key')} rules {rule_codes} to {recipient_email}")
             logger.debug(f"Send response: {resp}")
 
-            # Log history
-            record = {
-                "task_key": task["key"],
-                "rule_type": code,
-                "to": recipient_email,
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-                "status": "sent" if ok else "failed",
-                "response": json.dumps(resp) if isinstance(resp, dict) else str(resp),
-            }
-            _append_history(history_path, record)
+            # Log history for each rule (to track individual rule sends)
+            for code, data, _ in recipient_finding_list:
+                record = {
+                    "task_key": task["key"],
+                    "rule_type": code,
+                    "to": recipient_email,
+                    "sent_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "sent" if ok else "failed",
+                    "response": json.dumps(resp) if isinstance(resp, dict) else str(resp),
+                }
+                _append_history(history_path, record)
 
     logger.info(f"Attempts: {count_attempt}, Sent: {count_sent}")
  

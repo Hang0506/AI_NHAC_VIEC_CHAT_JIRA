@@ -250,6 +250,25 @@ class JiraClient:
         data = resp.json()
         return data.get("worklogs", [])
 
+    def get_last_assignee_change(self, issue_key: str) -> Optional[str]:
+        """Lấy thời gian (ISO) khi assignee được thay đổi lần cuối, hoặc None nếu không tìm thấy."""
+        try:
+            issue = self.get_issue(issue_key, expand=["changelog"])
+            changelog = issue.get("changelog", {})
+            histories = changelog.get("histories", [])
+            # Tìm ngược từ mới nhất về cũ nhất
+            for history in reversed(histories):
+                created = history.get("created", "")
+                items = history.get("items", [])
+                for item in items:
+                    if item.get("field") == "assignee":
+                        # Tìm thấy thay đổi assignee
+                        return created
+            return None
+        except Exception as ex:
+            self.logger.warning(f"Failed to get changelog for {issue_key}: {ex}")
+            return None
+
     def get_issue_with_worklog(self, issue_key: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         print(f"[Jira] Lấy thông tin issue + worklog: {issue_key}")
         issue = self.get_issue(issue_key)
@@ -413,6 +432,10 @@ class JiraClient:
         # Flags (best-effort defaults)
         task["is_uat_done"] = False
         task["is_production"] = False
+        
+        # Last assignee change time (ISO) - lazy load only if needed
+        # Note: This is computed on-demand to avoid slowing down normal flows
+        task["last_assignee_changed_at"] = None
 
         return task
 
