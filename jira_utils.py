@@ -170,7 +170,7 @@ class JiraClient:
     def ping(self) -> bool:
         """Kiểm tra kết nối/JWT/BASIC hợp lệ bằng endpoint /myself."""
         try:
-            resp = self._request("GET", "/rest/api/2/myself")
+            resp = self._request("GET", "/secure/ViewProfile.jspa")
             if resp.status_code == 200:
                 print("[Jira] Ping OK: authenticated")
                 return True

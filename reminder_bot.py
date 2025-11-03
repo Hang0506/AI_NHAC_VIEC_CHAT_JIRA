@@ -117,48 +117,87 @@ def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: s
                  return True
      return False
  
-def build_message(task: dict, code: str, data: Optional[dict]) -> str:
-     """Build message for a single rule."""
-     url = task.get("task_url")
-     if code == MISSING_LOGTIME:
-         return f"⚠️ Task {task['key']} ({task['summary']}) đã ở CI Testing một thời gian mà chưa có logtime. Vui lòng logtime: {url}"
-     if code == MISSING_DESCRIPTION:
-         reporter = task.get("reporter_email") or ""
-         return f"📝 Task {task['key']} ({task['summary']}) hiện chưa có description. Reporter: {reporter}. Vui lòng bổ sung: {url}"
-     if code == PRE_VERSION_REMINDER and data:
-         return f"⏰ Task {task['key']} thuộc Fix Version {data['fv_name']} sắp release trong {data['days']} ngày, chưa lên UAT. Vui lòng kiểm tra: {url}"
-     if code == POST_VERSION_ALERT and data:
-         return f"🚨 Task {task['key']} thuộc Fix Version {data['fv_name']} đã quá hạn release ({data['release_date']}) nhưng chưa lên Production. Kiểm tra gấp: {url}"
-     if code == ASSIGNEE_CHANGED and data:
-         return f"👤 Task {task['key']} ({task['summary']}) vừa được gán cho bạn. Vui lòng kiểm tra: {url}"
-     return f"ℹ️ Task {task['key']}: {url}"
+def build_message(task: dict, code: str, data: Optional[dict] = None) -> str:
+    """Tạo nội dung tin nhắn thân thiện cho từng rule."""
+    url = task.get("task_url")
+    key = task.get("key")
+    summary = task.get("summary", "")
+    
+    if code == MISSING_LOGTIME:
+        return (
+            f"⏰ Anh/chị ơi, mình quên logtime cho task [{key}] - {summary} rồi nè. "
+            f"Nhớ cập nhật sớm nha 👉 {url}"
+        )
+    
+    if code == MISSING_DESCRIPTION:
+        reporter = task.get("reporter_email") or ""
+        return (
+            f"📝 Task [{key}] - {summary} chưa có mô tả chi tiết đó ạ. "
+            f"Anh/chị {reporter} bổ sung giúp em để dev đỡ phải đoán nha 😅 👉 {url}"
+        )
+    
+    if code == PRE_VERSION_REMINDER and data:
+        return (
+            f"📦 Task [{key}] - {summary} thuộc version **{data['fv_name']}** "
+            f"sắp release trong {data['days']} ngày nữa đó ạ. "
+            f"Nếu chưa lên UAT thì mình check gấp giúp em nha 🙏 👉 {url}"
+        )
+    
+    if code == POST_VERSION_ALERT and data:
+        return (
+            f"🚨 Task [{key}] - {summary} thuộc version **{data['fv_name']}** "
+            f"đã quá hạn release ({data['release_date']}) mà chưa thấy lên Production. "
+            f"Mình kiểm tra giúp em với nha 🕐 👉 {url}"
+        )
+    
+    if code == ASSIGNEE_CHANGED and data:
+        old = data.get("old_assignee") or ""
+        new = task.get("assignee_email") or ""
+        return (
+            f"👋 Task [{key}] - {summary} vừa được giao cho mình bắt đầu làm thôi nè) "
+            f" 💪 👉 {url}"
+        )
+    
+    return f"ℹ️ Task [{key}] - {summary}: {url}"
 
 def build_combined_message(task: dict, findings: List[Tuple[str, Optional[dict], str]]) -> str:
-     """Build combined message for multiple rules of the same task."""
-     url = task.get("task_url")
-     task_key = task.get('key', '')
-     task_summary = task.get('summary', '')
-     
-     messages = []
-     for code, data, _ in findings:
-         if code == MISSING_LOGTIME:
-             messages.append("⚠️ Đã ở CI Testing một thời gian mà chưa có logtime. Vui lòng logtime.")
-         elif code == MISSING_DESCRIPTION:
-             reporter = task.get("reporter_email") or ""
-             messages.append(f"📝 Chưa có description. Reporter: {reporter}. Vui lòng bổ sung.")
-         elif code == PRE_VERSION_REMINDER and data:
-             messages.append(f"⏰ Thuộc Fix Version {data['fv_name']} sắp release trong {data['days']} ngày, chưa lên UAT. Vui lòng kiểm tra.")
-         elif code == POST_VERSION_ALERT and data:
-             messages.append(f"🚨 Thuộc Fix Version {data['fv_name']} đã quá hạn release ({data['release_date']}) nhưng chưa lên Production. Kiểm tra gấp.")
-         elif code == ASSIGNEE_CHANGED and data:
-             messages.append("👤 Vừa được gán cho bạn.")
-     
-     if messages:
-         combined = f"Task {task_key} ({task_summary}):\n" + "\n".join(f"• {msg}" for msg in messages) + f"\n\nVui lòng kiểm tra: {url}"
-         return combined
-     
-     return f"ℹ️ Task {task_key}: {url}"
- 
+    """Tạo tin nhắn tổng hợp (giọng dễ thương, thân thiện) cho nhiều rule cùng một task."""
+    url = task.get("task_url")
+    task_key = task.get("key", "")
+    task_summary = task.get("summary", "")
+
+    messages = []
+
+    for code, data, _ in findings:
+        if code == MISSING_LOGTIME:
+            messages.append("⏰ Anh/chị ơi, mình ở CI Testing hơi lâu mà chưa logtime đó nha 😅.")
+        elif code == MISSING_DESCRIPTION:
+            reporter = task.get("reporter_email") or "Reporter"
+            messages.append(f"📝 Task chưa có description. Anh/chị {reporter} bổ sung giúp em với, để dev đỡ đoán nha 🙏.")
+        elif code == PRE_VERSION_REMINDER and data:
+            messages.append(
+                f"📦 Task thuộc version **{data['fv_name']}** sắp release trong {data['days']} ngày nữa. "
+                f"Nếu chưa lên UAT thì mình check giúp em nha 🕵️‍♂️."
+            )
+        elif code == POST_VERSION_ALERT and data:
+            messages.append(
+                f"🚨 Task thuộc version **{data['fv_name']}** đã quá hạn release ({data['release_date']}) "
+                f"mà vẫn chưa thấy lên Production. Mình xử lý gấp giúp em với nha 🏃‍♀️."
+            )
+        elif code == ASSIGNEE_CHANGED and data:
+            messages.append("👋 Bé bot báo nè! Task này vừa được gán cho anh/chị đó, cùng chiến thôi 💪.")
+
+    if messages:
+        combined = (
+            f"🎯 Task [{task_key}] - {task_summary}:\n"
+            + "\n".join(f"• {msg}" for msg in messages)
+            + f"\n\n🔗 Link kiểm tra nhanh: {url}\n"
+            + "— Bé bot nhà FRT thân ái nhắc nhẹ ❤️"
+        )
+        return combined
+
+    return f"ℹ️ Task [{task_key}] - {task_summary}: {url}"
+
 def run_once():
     load_dotenv()
     jira_url = os.getenv("JIRA_URL")
@@ -170,8 +209,8 @@ def run_once():
     chat_bot_id = os.getenv("FPT_CHAT_BOT_ID", "")
     schedule_minutes = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "15"))
     employees_file = os.getenv("EMPLOYEES_FILE", "employees.csv")
-    #projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "FC,FSS,PPFP").split(",")) if p.strip()]
-    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "PPFP").split(",")) if p.strip()]
+    #projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "FC,FSS,PPFP,FADS").split(",")) if p.strip()]
+    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "PPFP,FADS").split(",")) if p.strip()]
     history_path = os.getenv("REMINDER_HISTORY_FILE", "data/reminder_logs.csv")
 
     config_path = os.path.join(os.getcwd(), "rules_config.json")
