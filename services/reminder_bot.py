@@ -5,12 +5,13 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 import pandas as pd
- 
+
 from dotenv import load_dotenv
- 
+
 from logger import get_logger
-from jira_utils import JiraClient
-from rules import (
+from services.log_service import create_log as create_log_service
+from services.jira_utils import JiraClient
+from services.rules import (
      evaluate_missing_logtime,
      evaluate_missing_description,
      evaluate_pre_version_reminder,
@@ -22,48 +23,43 @@ from rules import (
      POST_VERSION_ALERT,
      ASSIGNEE_CHANGED,
 )
-from chat_api import send_message_fpt
- 
+from services.chat_api import send_message_fpt
+from db.session import get_session
+from db.repositories.log_repo import LogRepository
+from db.repositories.employee_repo import EmployeeRepository
+
 logger = get_logger()
- 
+
 def _load_json(path: str) -> dict:
      with open(path, "r", encoding="utf-8") as f:
          return json.load(f)
- 
+
 def _ensure_dirs(path: str):
      os.makedirs(os.path.dirname(path), exist_ok=True)
- 
+
 def _read_employees(path: str) -> pd.DataFrame:
-     logger.info(f"Loading employees mapping from: {path}")
-     if not os.path.exists(path):
-         logger.warning(f"Employees file not found: {path}")
-         return pd.DataFrame(columns=["email", "chat_id"]) 
-     _, ext = os.path.splitext(path.lower())
-     if ext in (".xlsx", ".xls"):
-         df = pd.read_excel(path)
-     else:
-         # Try normal read first (expects header row). If no email-like column is found, fallback to no-header.
-         df = pd.read_csv(path, keep_default_na=False)
-         lower_cols = [c.lower() for c in df.columns]
-         if not any(c in ("email", "e-mail", "chat_id") for c in lower_cols):
-             logger.info("employees.csv seems to have no header; re-reading with header=None")
-             df = pd.read_csv(path, header=None, names=["email", "chat_id"], keep_default_na=False)
-     # Normalize columns
-     cols = {c.lower(): c for c in df.columns}
-     email_col = cols.get("email") or cols.get("e-mail") or list(df.columns)[0]
-     chat_col = cols.get("chat_id") if "chat_id" in cols else None
-     if chat_col is None:
-         df = df.rename(columns={email_col: "email"})
-         df["chat_id"] = ""
-     else:
-         df = df.rename(columns={email_col: "email", chat_col: "chat_id"})
-     df["email"] = df["email"].fillna("").astype(str).str.strip()
-     df["chat_id"] = df["chat_id"].fillna("").astype(str).str.strip()
-     # Drop empty or invalid email rows
-     df = df[(df["email"] != "") & (df["email"].str.lower() != "nan")]
-     logger.info(f"Loaded employees: {len(df)} rows")
-     return df[["email", "chat_id"]]
- 
+     """Load employees mapping from DB (email -> chat_id via group_id).
+     The CSV file is no longer used.
+     """
+     logger.info("Loading employees mapping from DB (ignoring CSV)")
+     try:
+         with get_session() as session:
+             repo = EmployeeRepository(session)
+             # Fetch a large batch of employees; adjust limit if needed
+             employees = repo.list(limit=10000, offset=0, group_id=None)
+             records = []
+             for emp in employees:
+                 email = (getattr(emp, "email", "") or "").strip()
+                 chat_id = (getattr(emp, "group_id", "") or "").strip()
+                 if email:
+                     records.append({"email": email, "chat_id": chat_id})
+             df = pd.DataFrame.from_records(records, columns=["email", "chat_id"]) if records else pd.DataFrame(columns=["email", "chat_id"])
+             logger.info(f"Loaded employees from DB: {len(df)} rows")
+             return df
+     except Exception as ex:
+         logger.exception(f"Failed to load employees from DB: {ex}")
+         return pd.DataFrame(columns=["email", "chat_id"])
+
 def _lookup_chat_id(df: pd.DataFrame, email: str) -> str:
      if not email:
          return ""
@@ -74,36 +70,57 @@ def _lookup_chat_id(df: pd.DataFrame, email: str) -> str:
      chat_id = row.iloc[0]["chat_id"]
      logger.debug(f"Mapped email {email} -> chat_id '{chat_id}'")
      return chat_id if isinstance(chat_id, str) else ""
- 
+
 def _load_history(path: str):
-     if not os.path.exists(path):
-         return []
+     """Load reminder send history from DB logs (source='reminder_bot').
+     The CSV file is ignored to avoid parsing issues.
+     """
      try:
-         # Tránh lỗi khi file rỗng
-         if os.path.getsize(path) == 0:
-             logger.info(f"History file exists but empty: {path}")
-             return []
-         rows = pd.read_csv(path).to_dict(orient="records")
-         logger.info(f"Loaded reminder history: {len(rows)} records from {path}")
+         with get_session() as session:
+             logs = LogRepository(session).list_by_source("reminder_bot", limit=5000)
+         rows = []
+         for log in logs:
+             try:
+                 rec = json.loads(getattr(log, "message", ""))
+                 if isinstance(rec, dict) and rec.get("task_key") and rec.get("rule_type") and rec.get("to"):
+                     rows.append(rec)
+             except Exception:
+                 continue
+         logger.info(f"Loaded reminder history from DB: {len(rows)} records")
          return rows
      except Exception as ex:
-         logger.exception(f"Failed to load history from {path}: {ex}")
+         logger.exception(f"Failed to load history from DB: {ex}")
          return []
- 
+
 def _append_history(path: str, record: dict):
-     _ensure_dirs(path)
-     exists = os.path.exists(path)
-     is_empty = False
-     if exists:
-         try:
-             is_empty = os.path.getsize(path) == 0
-         except Exception:
-             is_empty = False
-     header_needed = (not exists) or is_empty
-     df = pd.DataFrame([record])
-     df.to_csv(path, mode='a', header=header_needed, index=False)
+     # Keep CSV write as best-effort (optional), but DB is the source of truth
+     try:
+         _ensure_dirs(path)
+         exists = os.path.exists(path)
+         is_empty = False
+         if exists:
+             try:
+                 is_empty = os.path.getsize(path) == 0
+             except Exception:
+                 is_empty = False
+         header_needed = (not exists) or is_empty
+         df = pd.DataFrame([record])
+         df.to_csv(path, mode='a', header=header_needed, index=False)
+     except Exception:
+         # Ignore CSV errors silently; DB logging below is primary
+         pass
      logger.debug(f"Appended history record for task {record.get('task_key')} rule {record.get('rule_type')} -> {record.get('status')}")
- 
+
+
+def _append_history_service(record: dict):
+    """Persist reminder send history via shared service (no HTTP)."""
+    try:
+        level = "INFO" if record.get("status") == "sent" else "WARNING"
+        message = json.dumps(record, ensure_ascii=False)
+        create_log_service(level=level, source="reminder_bot", message=message)
+    except Exception as ex:
+        logger.exception(f"Failed to write history via service: {ex}")
+
 def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: str, resend_after_hours: int) -> bool:
      now = datetime.now(timezone.utc)
      for r in history_rows:
@@ -116,7 +133,7 @@ def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: s
                  logger.debug(f"Skip send: recently sent for {task_key} {rule_code} to {to_value}")
                  return True
      return False
- 
+
 def build_message(task: dict, code: str, data: Optional[dict] = None) -> str:
     """Tạo nội dung tin nhắn thân thiện cho từng rule."""
     url = task.get("task_url")
@@ -363,9 +380,10 @@ def run_once():
                     "response": json.dumps(resp) if isinstance(resp, dict) else str(resp),
                 }
                 _append_history(history_path, record)
+                _append_history_service(record)
 
     logger.info(f"Attempts: {count_attempt}, Sent: {count_sent}")
- 
+
 def parse_and_run():
      parser = argparse.ArgumentParser()
      parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
@@ -375,7 +393,6 @@ def parse_and_run():
      else:
          # default single run for now
          run_once()
- 
+
 if __name__ == "__main__":
     parse_and_run()
-

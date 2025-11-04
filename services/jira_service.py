@@ -3,9 +3,12 @@ from typing import Any
 from core.config import settings
 
 try:
-    import jira_utils  # type: ignore
+    from services import jira_utils  # type: ignore
 except Exception:  # pragma: no cover
-    jira_utils = None  # type: ignore
+    try:
+        import jira_utils  # type: ignore
+    except Exception:
+        jira_utils = None  # type: ignore
 
 
 class JiraService:

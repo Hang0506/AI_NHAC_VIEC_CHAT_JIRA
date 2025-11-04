@@ -23,3 +23,5 @@ def downgrade() -> None:
     from db.base import Base
     bind = op.get_bind()
     Base.metadata.drop_all(bind=bind)
+
+

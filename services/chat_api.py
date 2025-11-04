@@ -154,4 +154,3 @@ def send_message_fpt(
 
     # Case D: neither provided
     return False, {"error": "No recipients: both user_emails and group_id are empty"}
-

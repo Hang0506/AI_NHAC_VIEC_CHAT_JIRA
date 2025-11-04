@@ -1,9 +1,12 @@
 from core.config import settings
 
 try:
-    import chat_api  # type: ignore
+    from services import chat_api  # type: ignore
 except Exception:  # pragma: no cover
-    chat_api = None  # type: ignore
+    try:
+        import chat_api  # type: ignore
+    except Exception:
+        chat_api = None  # type: ignore
 
 
 class ChatService:

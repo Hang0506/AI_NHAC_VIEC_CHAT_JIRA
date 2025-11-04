@@ -11,3 +11,9 @@ class LogOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class LogIn(BaseModel):
+    level: str
+    source: str
+    message: str

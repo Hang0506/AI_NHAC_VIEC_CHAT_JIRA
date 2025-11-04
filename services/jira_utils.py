@@ -478,5 +478,3 @@ class JiraClient:
 
 
 __all__ = ["JiraClient"]
-
-

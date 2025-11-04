@@ -161,4 +161,3 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
     
     print("[Rules] -> no hit: change too old")
     return None
-

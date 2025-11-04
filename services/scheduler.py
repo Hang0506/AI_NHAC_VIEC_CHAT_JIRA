@@ -2,8 +2,10 @@ from __future__ import annotations
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
+import time
 
 from core.config import settings
+from core.logging import configure_logging
 from services.reminder_service import ReminderService
 from services.jira_service import JiraService
 from services.chat_service import ChatService
@@ -31,7 +33,7 @@ def _job_run_legacy_bot() -> None:
     logger.info("Running legacy reminder_bot.run_once()")
     try:
         # Import locally to avoid import cost/cycles at module import time
-        from reminder_bot import run_once
+        from services.reminder_bot import run_once
         run_once()
     except Exception as ex:
         logger.exception("Legacy bot run failed: {}", ex)
@@ -106,3 +108,22 @@ def shutdown_scheduler(scheduler: BackgroundScheduler) -> None:
     if scheduler.running:
         scheduler.shutdown(wait=False)
         logger.info("Scheduler shutdown")
+
+
+def main() -> None:
+    """Module entrypoint to run the worker in Docker (python -m services.scheduler)."""
+    configure_logging()
+    logger.info("Worker starting (scheduler_enabled={})", settings.scheduler_enabled)
+    scheduler = get_scheduler()
+    start_scheduler(scheduler)
+    try:
+        # Keep the process alive so the container does not exit
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info("Worker received shutdown signal")
+        shutdown_scheduler(scheduler)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from rules import (
+from services.rules import (
     evaluate_missing_logtime,
     evaluate_missing_description,
     evaluate_pre_version_reminder,
