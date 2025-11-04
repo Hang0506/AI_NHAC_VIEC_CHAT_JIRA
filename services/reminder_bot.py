@@ -234,8 +234,10 @@ def run_once():
     config = _load_json(config_path) if os.path.exists(config_path) else {}
     ci_wait = int(config.get("ci_testing_wait_minutes", 5))
     pre_days = int(config.get("pre_version_days", 2))
-    resend_after_hours = int(config.get("resend_after_hours", 8))
-    assignee_change_wait = int(config.get("assignee_change_wait_minutes", 5))
+    # Dedup window per requirement: 3 hours by default
+    resend_after_hours = int(config.get("resend_after_hours", 3))
+    # Rule 1 window: consider tasks assigned within last 60 minutes by default
+    assignee_change_wait = int(config.get("assignee_change_wait_minutes", 60))
     domains_allowed = config.get("domains_allowed", ["FRT"])
 
     logger.info("Starting reminder run")

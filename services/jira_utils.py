@@ -198,7 +198,55 @@ class JiraClient:
         page = start_at
         print("[Jira] Bắt đầu tìm kiếm issues theo JQL...")
         print(f"[Jira] JQL: {jql}")
+        # =========================
+        # OLD PREFLIGHT (đã đóng tạm)
+        # Mục đích: gọi thử search 1 issue trước khi chạy vòng lặp chính.
+        # Lý do đóng: thay bằng bản mới gọn hơn bên dưới. Khi cần có thể mở lại.
+        #
+        # try:
+        #     if os.getenv("JIRA_PREFLIGHT_PPF933", "0").strip().lower() in ("1", "true", "yes"):
+        #         pre_jql = "key = PPFP-933"
+        #         print(f"[Jira] Preflight search enabled. Testing with: {pre_jql}")
+        #         pre_params = {
+        #             "jql": pre_jql,
+        #             "maxResults": 1,
+        #             "startAt": 0,
+        #             "fields": "key,summary,status",
+        #         }
+        #         pre_resp = self._request("GET", "/rest/api/2/search", params=pre_params)
+        #         if pre_resp.status_code == 200:
+        #             pre_data = pre_resp.json() or {}
+        #             pre_count = len(pre_data.get("issues", []))
+        #             print(f"[Jira] Preflight OK: {pre_count} issue(s) matched PPFP-933")
+        #         else:
+        #             print(f"[Jira] Preflight FAILED: {pre_resp.status_code} - {pre_resp.text[:200]}")
+        # except Exception as ex:
+        #     print(f"[Jira] Preflight error: {ex}")
 
+        # =========================
+        # NEW PREFLIGHT (đang dùng)
+        # - Giả lập/gọi test nhanh với điều kiện search của ticket PPFP-933
+        # - Luôn chạy 1 lần trước vòng lặp chính để kiểm tra kết nối/quyền truy cập
+        # - Không ảnh hưởng tới kết quả search chính (không sửa 'jql' ban đầu)
+        try:
+            pre_params = {
+                "jql": "key = PPFP-933",  # thêm điều kiện search này: https://reqs.frt.vn/browse/PPFP-933
+                "maxResults": 1,
+                "startAt": 0,
+                "fields": "key,summary,status",
+            }
+            print("[Jira] Preflight (NEW): search PPFP-933 để kiểm tra nhanh")
+            pre_resp = self._request("GET", "/rest/api/2/search", params=pre_params)
+            if pre_resp.status_code == 200:
+                pre_data = pre_resp.json() or {}
+                pre_issues = pre_data.get("issues", [])
+                pre_count = len(pre_issues)
+                pre_key = pre_issues[0]["key"] if pre_count else ""
+                print(f"[Jira] Preflight (NEW) OK: {pre_count} issue(s). First: {pre_key}")
+            else:
+                print(f"[Jira] Preflight (NEW) FAILED: {pre_resp.status_code} - {pre_resp.text[:200]}")
+        except Exception as ex:
+            print(f"[Jira] Preflight (NEW) error: {ex}")
         while True:
             params: Dict[str, Any] = {
                 "jql": jql,
@@ -220,6 +268,8 @@ class JiraClient:
                 raise RuntimeError(
                     f"JQL search failed: {resp.status_code} | auth_type={self.auth_type} | verify_ssl={self.session.verify} | body={details[:300]}"
                 )
+
+                
 
             data = resp.json()
             issues = data.get("issues", [])

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 
 # Rule identifiers
 MISSING_LOGTIME = "missing_logtime"
@@ -8,7 +9,20 @@ POST_VERSION_ALERT = "post_version_alert"
 ASSIGNEE_CHANGED = "assignee_changed"
 
 
+def _log_task_preview(prefix, task):
+    try:
+        preview = json.dumps(task, ensure_ascii=False, default=str)
+    except Exception as e:
+        print(f"{prefix} task_preview=<unserializable> error={e}")
+        return
+    max_len = 2000
+    if len(preview) > max_len:
+        preview = preview[:max_len] + "...(truncated)"
+    print(f"{prefix} task_preview={preview}")
+
+
 def evaluate_missing_logtime(task, ci_testing_wait_minutes):
+    _log_task_preview("[Rules] evaluate_missing_logtime input:", task)
     status_raw = task.get('status')
     status_norm = (status_raw or "").strip().upper()
     print(f"[Rules] evaluate_missing_logtime: key={task.get('key')} status={status_raw} (norm={status_norm}) has_worklog={task.get('has_worklog')} last_status_changed_at={task.get('last_status_changed_at')} wait={ci_testing_wait_minutes}m")
@@ -40,6 +54,7 @@ def evaluate_missing_logtime(task, ci_testing_wait_minutes):
 
 
 def evaluate_missing_description(task):
+    _log_task_preview("[Rules] evaluate_missing_description input:", task)
     description = task.get("description")
     print(f"[Rules] evaluate_missing_description: key={task.get('key')} has_desc={bool(description and str(description).strip())}")
     if description is None or str(description).strip() == "":
@@ -50,15 +65,19 @@ def evaluate_missing_description(task):
 
 
 def evaluate_pre_version_reminder(task, pre_version_days):
-    # Need fixVersion dates and UAT flag
+    _log_task_preview("[Rules] evaluate_pre_version_reminder input:", task)
+    # Need fixVersion dates and ensure status not in UAT phases
     fix_versions = task.get("fixVersions") or []
     fv_dates = task.get("fixVersion_dates") or {}
-    print(f"[Rules] evaluate_pre_version_reminder: key={task.get('key')} fv_count={len(fix_versions)} is_uat_done={task.get('is_uat_done')} pre_days={pre_version_days}")
+    status_raw = task.get("status")
+    status_norm = (status_raw or "").strip().upper()
+    print(f"[Rules] evaluate_pre_version_reminder: key={task.get('key')} fv_count={len(fix_versions)} status={status_raw} (norm={status_norm}) pre_days={pre_version_days}")
     if not fix_versions:
         print("[Rules] -> skip: no fixVersions")
         return None
-    if task.get("is_uat_done"):
-        print("[Rules] -> skip: UAT done")
+    # Skip if already in UAT phases
+    if status_norm in {"UAT", "UAT TESTING"}:
+        print("[Rules] -> skip: status is UAT/UAT TESTING")
         return None
     now = datetime.now()
     for fv in fix_versions:
@@ -85,15 +104,19 @@ def evaluate_pre_version_reminder(task, pre_version_days):
 
 
 def evaluate_post_version_alert(task):
-    # After release date and not in production
+    _log_task_preview("[Rules] evaluate_post_version_alert input:", task)
+    # After release date and status not Complete
     fix_versions = task.get("fixVersions") or []
     fv_dates = task.get("fixVersion_dates") or {}
-    print(f"[Rules] evaluate_post_version_alert: key={task.get('key')} fv_count={len(fix_versions)} is_production={task.get('is_production')}")
+    status_raw = task.get("status")
+    status_norm = (status_raw or "").strip().upper()
+    print(f"[Rules] evaluate_post_version_alert: key={task.get('key')} fv_count={len(fix_versions)} status={status_raw} (norm={status_norm})")
     if not fix_versions:
         print("[Rules] -> skip: no fixVersions")
         return None
-    if task.get("is_production"):
-        print("[Rules] -> skip: already in production")
+    # Skip if already Complete
+    if status_norm == "COMPLETE":
+        print("[Rules] -> skip: status is Complete")
         return None
     now = datetime.now()
     for fv in fix_versions:
@@ -123,6 +146,7 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
     Kiểm tra nếu assignee được thay đổi trong vòng X phút.
     Cần có last_assignee_changed_at trong task (lấy từ changelog).
     """
+    _log_task_preview("[Rules] evaluate_assignee_changed input:", task)
     assignee_email = task.get("assignee_email")
     print(f"[Rules] evaluate_assignee_changed: key={task.get('key')} assignee={assignee_email} wait={assignee_change_wait_minutes}m")
     
