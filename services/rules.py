@@ -22,7 +22,7 @@ ASSIGNEE_CHANGED = "assignee_changed"
 TEST_EMAILS = [
 
 ]
-TEST_MODE_ENABLED = len(TEST_EMAILS) > 0  # Chỉ bật test mode khi có email trong danh sách
+TEST_MODE_ENABLED = len(TEST_EMAILS) > 0  # Chỉ bật test mode khi có email trong danh sách; rỗng = chạy all
 
 # Cấu hình project bị loại trừ cho từng rule
 # Mỗi rule có thể có danh sách project không được áp dụng rule đó
@@ -60,13 +60,13 @@ def is_project_excluded(project: str, rule_code: str) -> bool:
 def is_test_email(email: str) -> bool:
     """Kiểm tra email có trong danh sách test không.
     Nếu TEST_EMAILS không trống, chỉ cho phép email trong danh sách.
-    Nếu TEST_EMAILS trống, không cho phép gì cả (đang test/giả lập).
+    Nếu TEST_EMAILS trống, cho phép tất cả (auto chạy all, không filter theo email).
     """
     if not email:
         return False
-    # Nếu danh sách test trống, không cho phép gì cả
+    # Nếu danh sách test trống, cho phép tất cả
     if not TEST_EMAILS:
-        return False
+        return True
     # Chỉ cho phép email trong danh sách test
     email_lower = email.strip().lower()
     return any(test_email.lower() == email_lower for test_email in TEST_EMAILS)
@@ -162,17 +162,11 @@ def evaluate_missing_description(task):
     print(f"[Rules] evaluate_missing_description START: key={task_key} project={project_key}")
     
     description = task.get("description")
-    print(f"[Rules]   step 1: get description from task")
-    print(f"[Rules]   step 1: description type={type(description)}")
-    print(f"[Rules]   step 1: description raw={repr(description)}")
-    
     if description is None:
-        print(f"[Rules]   step 2: description is None -> HIT")
         print(f"[Rules] evaluate_missing_description END: key={task_key} -> one HIT")
         return MISSING_DESCRIPTION
     
     description_str = str(description)
-    print(f"[Rules]   step 2: convert to string -> {repr(description_str)}")
     
     description_stripped = description_str.strip()
     print(f"[Rules]   step 3: strip whitespace -> {repr(description_stripped)}")
@@ -327,7 +321,6 @@ def evaluate_post_version_alert(task):
     fv_dates = task.get("fixVersion_dates") or {}
     status_raw = task.get("status")
     status_norm = (status_raw or "").strip().upper()
-    print(f"[Rules] evaluate_post_version_alert: key={task.get('key')} project={project_key} fv_count={len(fix_versions)} status={status_raw} (norm={status_norm})")
     if not fix_versions:
         print("[Rules] -> skip: no fixVersions")
         return None
@@ -390,7 +383,6 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
         print(f"[Rules] evaluate_assignee_changed: project {project_key} is excluded -> SKIP")
         return None
     assignee_email = task.get("assignee_email")
-    print(f"[Rules] evaluate_assignee_changed: key={task.get('key')} project={project_key} assignee={assignee_email} wait={assignee_change_wait_minutes}m")
     
     if not assignee_email:
         print("[Rules] -> skip: no assignee")

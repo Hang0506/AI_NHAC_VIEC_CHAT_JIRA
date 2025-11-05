@@ -13,3 +13,5 @@ class Log(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     task_key: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    # New: store rule type explicitly for fast filtering (e.g., reminder rules)
+    rule_type: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)

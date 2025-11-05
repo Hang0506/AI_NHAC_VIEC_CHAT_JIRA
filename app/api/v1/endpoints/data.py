@@ -16,13 +16,21 @@ router = APIRouter()
 @router.post("/logs", response_model=LogOut)
 def create_log(payload: LogIn, session: Session = Depends(get_db_session)):
     try:
-        log = create_log_service(level=payload.level, source=payload.source, message=payload.message, session=session)
+        log = create_log_service(
+            level=payload.level,
+            source=payload.source,
+            message=payload.message,
+            email=getattr(payload, "email", None),
+            task_key=getattr(payload, "task_key", None),
+            rule_type=getattr(payload, "rule_type", None),
+            session=session,
+        )
         return log
     except Exception as ex:
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-@router.post("/employees/import", tags=["employees"])
+@router.post("/employees/import")
 def import_employees(file_path: str = "resource/projects_employees.xlsx", session: Session = Depends(get_db_session)):
     try:
         result = import_employees_from_excel(file_path=file_path, session=session)
@@ -31,7 +39,7 @@ def import_employees(file_path: str = "resource/projects_employees.xlsx", sessio
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-@router.post("/employees/import-file", tags=["employees"])
+@router.post("/employees/import-file")
 async def import_employees_file(file: UploadFile = File(...), session: Session = Depends(get_db_session)):
     try:
         data = await file.read()
@@ -41,7 +49,7 @@ async def import_employees_file(file: UploadFile = File(...), session: Session =
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-@router.post("/employees", response_model=EmployeeOut, tags=["employees"])
+@router.post("/employees", response_model=EmployeeOut)
 def create_employee(payload: EmployeeIn, session: Session = Depends(get_db_session)):
     try:
         logger.debug(
@@ -73,7 +81,7 @@ def create_employee(payload: EmployeeIn, session: Session = Depends(get_db_sessi
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-@router.get("/employees", response_model=list[EmployeeOut], tags=["employees"])
+@router.get("/employees", response_model=list[EmployeeOut])
 def list_employees(
     limit: int = 100,
     offset: int = 0,
@@ -91,7 +99,7 @@ def list_employees(
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-@router.get("/employees/{employee_id}", response_model=EmployeeOut, tags=["employees"])
+@router.get("/employees/{employee_id}", response_model=EmployeeOut)
 def get_employee(employee_id: int, session: Session = Depends(get_db_session)):
     try:
         repo = EmployeeRepository(session)
