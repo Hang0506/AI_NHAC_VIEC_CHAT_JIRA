@@ -13,6 +13,11 @@ class LogRepository:
         self.session.add(log)
         return log
 
+    def batch_add(self, logs: list[Log]) -> list[Log]:
+        """Batch insert multiple log records."""
+        self.session.add_all(logs)
+        return logs
+
     def list_by_source(self, source: str, limit: int = 1000) -> list[Log]:
         stmt = (
             select(Log)

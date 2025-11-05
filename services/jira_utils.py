@@ -2,12 +2,22 @@ import os
 import json
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.auth import HTTPBasicAuth
 
 from logger import get_logger
+
+# Timezone Việt Nam
+VN_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+def get_vn_now() -> datetime:
+    """Lấy datetime hiện tại theo giờ Việt Nam."""
+    return datetime.now(VN_TIMEZONE)
 
 
 class JiraClient:
@@ -54,6 +64,8 @@ class JiraClient:
             self.auth = HTTPBasicAuth(username, password_or_token)
         self.timeout_seconds = timeout_seconds
         self.session = requests.Session()
+        # Thread-local sessions for parallel requests
+        self._thread_local = threading.local()
         # SSL verify: env overrides default if not specified
         if verify_ssl is None:
             env_v = os.getenv("JIRA_VERIFY_SSL")
@@ -136,6 +148,14 @@ class JiraClient:
         json_body: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> requests.Response:
+        # Use a thread-local session for thread safety when parallelizing
+        sess = getattr(self._thread_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            # Mirror SSL verify setting
+            sess.verify = self.session.verify
+            self._thread_local.session = sess
+
         url = url_or_path
         if not url_or_path.lower().startswith("http"):
             url = f"{self.jira_url}{url_or_path}"
@@ -150,10 +170,10 @@ class JiraClient:
         print(f"[Jira] {method.upper()} {url}")
         self.logger.debug(f"curl: {curl_cmd}")
         print(f"[Jira] curl: {curl_cmd}")
-        self._write_log_file(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {method.upper()} {url}")
+        self._write_log_file(f"[{get_vn_now().strftime('%Y-%m-%d %H:%M:%S')}] {method.upper()} {url}")
         self._write_log_file(f"curl: {curl_cmd}")
 
-        resp = self.session.request(
+        resp = sess.request(
             method=method,
             url=url,
             auth=self.auth,
@@ -221,6 +241,8 @@ class JiraClient:
         fields: Optional[List[str]] = None,
         expand: Optional[List[str]] = None,
         max_results: int = 1000,
+        use_parallel: bool = False,
+        parallel_workers: int = 8,
         start_at: int = 0,
         show_first_url: bool = True,
     ) -> List[Dict[str, Any]]:
@@ -296,79 +318,133 @@ class JiraClient:
         # === PHẦN 2: VÒNG LẶP PHÂN TRANG CHÍNH (Tìm kiếm thực tế với JQL) ===
         # Mục đích: Thực hiện tìm kiếm issues theo JQL được truyền vào, tự động phân trang
         # để lấy tất cả kết quả (vì Jira API có giới hạn số lượng kết quả mỗi lần)
-        while True:
-            print("[Jira] Bắt đầu tìm kiếm issues theo JQL...")
-            print(f"[Jira] JQL: {jql}")
-            # Chuẩn bị tham số cho request search chính
-            params: Dict[str, Any] = {
-                "jql": jql,                    # Câu lệnh JQL để tìm kiếm (do người dùng truyền vào)
-                "maxResults": max_results,     # Số lượng kết quả tối đa mỗi trang (mặc định 1000)
-                "startAt": page,               # Vị trí bắt đầu của trang hiện tại (để phân trang)
-            }
-            
-            # Thêm danh sách các trường (fields) cần lấy nếu được chỉ định
-            # Ví dụ: ["summary", "status", "assignee"] -> "summary,status,assignee"
-            if fields:
-                params["fields"] = ",".join(fields)
-            
-            # Thêm danh sách các phần mở rộng (expand) nếu được chỉ định
-            # Ví dụ: ["changelog", "renderedFields"] để lấy thêm thông tin chi tiết
-            if expand:
-                params["expand"] = ",".join(expand)
+        # First page to discover total and optionally reuse results
+        print("[Jira] Bắt đầu tìm kiếm issues theo JQL...")
+        print(f"[Jira] JQL: {jql}")
+        first_page_start = page  # Lưu lại startAt của trang đầu để tính toán chính xác
+        params: Dict[str, Any] = {
+            "jql": jql,
+            "maxResults": max_results,
+            "startAt": first_page_start,
+        }
+        if fields:
+            params["fields"] = ",".join(fields)
+        if expand:
+            params["expand"] = ",".join(expand)
+        if show_first_url:
+            self.logger.info("Search API initialized (URL hidden, see curl in debug logs)")
+        print(f"[Jira] Trang 1 (startAt={first_page_start}, maxResults={max_results})")
+        params_json = json.dumps(params, ensure_ascii=False, indent=2)
+        self.logger.info(f"API parameters: {params_json}")
+        print(f"[Jira] API parameters: {params_json}")
+        self._write_log_file(f"API parameters: {params_json}")
 
-            # Ghi log khi bắt đầu search (chỉ lần đầu tiên)
-            if show_first_url and page == start_at:
-                self.logger.info("Search API initialized (URL hidden, see curl in debug logs)")
+        resp = self._request("GET", "/rest/api/2/search", params=params)
+        if resp.status_code != 200:
+            details = resp.text.strip() if isinstance(resp.text, str) else ""
+            raise RuntimeError(
+                f"JQL search failed: {resp.status_code} | auth_type={self.auth_type} | verify_ssl={self.session.verify} | body={details[:300]}"
+            )
+        data = resp.json()
+        issues = data.get("issues", [])
+        collected.extend(issues)
+        total = data.get("total", 0)
+        first_page_count = len(issues)
+        print(f"[Jira] Trang đầu: thu được {first_page_count} issue (tổng lũy kế: {len(collected)}/{total})")
 
-            # In thông tin trang hiện tại (số trang, vị trí bắt đầu, số lượng kết quả)
-            print(f"[Jira] Trang {int(page/max_results)+1} (startAt={page}, maxResults={max_results})")
-            
-            # Log full API parameters
-            params_json = json.dumps(params, ensure_ascii=False, indent=2)
-            self.logger.info(f"API parameters: {params_json}")
-            print(f"[Jira] API parameters: {params_json}")
-            self._write_log_file(f"API parameters: {params_json}")
-            
-            # Gọi API search với tham số đã chuẩn bị
-            resp = self._request("GET", "/rest/api/2/search", params=params)
-            
-            # Kiểm tra mã trạng thái HTTP
-            if resp.status_code != 200:
-                # Nếu không phải 200 (OK): lấy chi tiết lỗi và raise exception
-                details = resp.text.strip() if isinstance(resp.text, str) else ""
-                raise RuntimeError(
-                    f"JQL search failed: {resp.status_code} | auth_type={self.auth_type} | verify_ssl={self.session.verify} | body={details[:300]}"
-                )
+        # Nếu đã đủ hoặc không có dữ liệu, return ngay
+        if total == 0 or len(collected) >= total:
+            print(f"[Jira] Hoàn tất tìm kiếm. Tổng số issue: {len(collected)}")
+            return collected
 
-            # === PHẦN 3: XỬ LÝ KẾT QUẢ TỪNG TRANG ===
-            # Parse JSON response từ Jira API
-            data = resp.json()
-            
-            # Lấy danh sách issues từ response (mỗi trang có thể có nhiều issues)
-            issues = data.get("issues", [])
-            
-            # Thêm tất cả issues của trang hiện tại vào danh sách tổng hợp (collected)
-            collected.extend(issues)
+        # If not using parallel, continue sequentially
+        if not use_parallel:
+            current_start = first_page_start + max_results
+            page_num = 2
+            while current_start < total:
+                print(f"[Jira] Trang {page_num} (startAt={current_start}, maxResults={max_results})")
+                params["startAt"] = current_start
+                params_json_page = json.dumps(params, ensure_ascii=False, indent=2)
+                self.logger.info(f"API parameters (page {page_num}): {params_json_page}")
+                print(f"[Jira] API parameters (page {page_num}): {params_json_page}")
+                self._write_log_file(f"API parameters (page {page_num}): {params_json_page}")
+                resp2 = self._request("GET", "/rest/api/2/search", params=params)
+                print(f"[Jira] Response (page {page_num}): status={resp2.status_code}")
+                self.logger.info(f"Response (page {page_num}): status={resp2.status_code}")
+                if resp2.status_code != 200:
+                    details2 = resp2.text.strip() if isinstance(resp2.text, str) else ""
+                    print(f"[Jira] Response error (page {page_num}): {details2[:500]}")
+                    self.logger.warning(f"Response error (page {page_num}): {details2[:500]}")
+                    raise RuntimeError(
+                        f"JQL search failed: {resp2.status_code} | body={details2[:300]}"
+                    )
+                try:
+                    data2 = resp2.json()
+                    issues2 = data2.get("issues", [])
+                    total_from_response = data2.get("total", 0)
+                    print(f"[Jira] Response (page {page_num}): total={total_from_response}, issues={len(issues2)}")
+                    self.logger.info(f"Response (page {page_num}): total={total_from_response}, issues={len(issues2)}")
+                    collected.extend(issues2)
+                    print(f"[Jira] Trang {page_num}: thu được {len(issues2)} issue (tổng lũy kế: {len(collected)}/{total})")
+                except Exception as ex:
+                    print(f"[Jira] Error parsing response (page {page_num}): {ex}")
+                    print(f"[Jira] Response text (first 500 chars): {resp2.text[:500] if hasattr(resp2, 'text') else 'N/A'}")
+                    self.logger.warning(f"Error parsing response (page {page_num}): {ex}")
+                    raise
+                current_start += max_results
+                page_num += 1
+                # Safety check: stop if we've collected enough
+                if len(collected) >= total:
+                    break
+            print(f"[Jira] Hoàn tất tìm kiếm. Tổng số issue: {len(collected)}")
+            return collected
 
-            # Lấy tổng số issues phù hợp với JQL (từ Jira API trả về)
-            total = data.get("total", 0)
-            
-            # In thông tin: số issues thu được ở trang này và tổng số đã thu được / tổng số có
-            print(f"[Jira] Thu được {len(issues)} issue (tổng lũy kế: {len(collected)}/{total})")
-            
-            # === PHẦN 4: ĐIỀU KIỆN DỪNG VÒNG LẶP ===
-            # Dừng vòng lặp nếu:
-            # - Số issues thu được < max_results: không còn trang nào nữa
-            # - Hoặc đã lấy đủ tất cả (page + số issues hiện tại >= tổng số)
-            if len(issues) < max_results or page + len(issues) >= total:
-                break
-            
-            # Tăng page lên để lấy trang tiếp theo (di chuyển sang trang sau)
-            page += max_results
+        # Parallel fetch remaining pages (chỉ các trang sau trang đầu)
+        # Tính toán chính xác các startAt còn lại, bắt đầu từ trang tiếp theo sau trang đầu
+        remaining_starts: List[int] = []
+        next_start = first_page_start + max_results  # Trang tiếp theo sau trang đầu
+        while next_start < total:
+            remaining_starts.append(next_start)
+            next_start += max_results
 
-        # === PHẦN 5: KẾT THÚC ===
-        # In thông tin tổng kết và trả về danh sách tất cả issues đã thu thập được
-        print(f"[Jira] Hoàn tất tìm kiếm. Tổng số issue: {len(collected)}")
+        if not remaining_starts:
+            print(f"[Jira] Không còn trang nào cần fetch. Hoàn tất tìm kiếm. Tổng số issue: {len(collected)}")
+            return collected
+
+        print(f"[Jira] Parallel fetching {len(remaining_starts)} trang còn lại (startAt từ {remaining_starts[0]} đến {remaining_starts[-1]}) với {parallel_workers} workers")
+
+        def fetch_page(start_at_value: int) -> List[Dict[str, Any]]:
+            """Fetch một trang với startAt cụ thể."""
+            local_params = dict(params)
+            local_params["startAt"] = start_at_value
+            params_json_parallel = json.dumps(local_params, ensure_ascii=False, indent=2)
+            self.logger.info(f"API parameters (parallel startAt={start_at_value}): {params_json_parallel}")
+            print(f"[Jira] API parameters (parallel startAt={start_at_value}): {params_json_parallel}")
+            self._write_log_file(f"API parameters (parallel startAt={start_at_value}): {params_json_parallel}")
+            r = self._request("GET", "/rest/api/2/search", params=local_params)
+            if r.status_code != 200:
+                raise RuntimeError(f"JQL page fetch failed: startAt={start_at_value} status={r.status_code}")
+            d = r.json()
+            return d.get("issues", [])
+
+        # Fetch các trang còn lại song song
+        with ThreadPoolExecutor(max_workers=max(1, int(parallel_workers))) as executor:
+            futures = {executor.submit(fetch_page, s): s for s in remaining_starts}
+            completed_count = 0
+            for future in as_completed(futures):
+                s = futures[future]
+                try:
+                    issues_page = future.result()
+                    collected.extend(issues_page)
+                    completed_count += 1
+                    print(f"[Jira] (parallel) startAt={s} -> {len(issues_page)} issues (lũy kế: {len(collected)}/{total}, completed: {completed_count}/{len(remaining_starts)})")
+                except Exception as ex:
+                    self.logger.warning(f"Parallel page fetch failed at startAt={s}: {ex}")
+                    print(f"[Jira] ERROR: Failed to fetch page startAt={s}: {ex}")
+
+        print(f"[Jira] Hoàn tất tìm kiếm. Tổng số issue: {len(collected)} (mong đợi: {total})")
+        if len(collected) != total:
+            self.logger.warning(f"Số lượng issue thu được ({len(collected)}) khác với total từ Jira ({total})")
         return collected
 
     def get_issue(self, issue_key: str, *, expand: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -583,7 +659,17 @@ class JiraClient:
     # -----------------------------
     # Convenience for reminder_bot
     # -----------------------------
-    def search_recent_tasks(self, minutes: int, cr_scan_days: int = 3, excluded_statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    def search_recent_tasks(
+        self,
+        minutes: int,
+        cr_scan_days: int = 3,
+        excluded_statuses: Optional[List[str]] = None,
+        test_emails: Optional[List[str]] = None,
+        *,
+        parallel: bool = True,
+        parallel_workers: int = 8,
+        page_size: int = 400,
+    ) -> List[Dict[str, Any]]:
         """Tìm tasks cập nhật trong X phút gần đây hoặc CR tasks trong vòng X ngày.
         Gộp thành 1 query duy nhất: (tasks updated in minutes) OR (CR tasks updated in cr_scan_days)
         """
@@ -596,22 +682,32 @@ class JiraClient:
         cr_filter = ""
         time_clause_2 = f"updated >= -{int(cr_scan_days)}d"
         contextquery = ''
-        #contextquery = 'text ~ "CLONE - Review và fix lại số liệu back-up để đảm bảo không vượt quá 20-30TB dự kiến"'
+        #contextquery = 'text ~ "Tạo link thanh toán Zalopay bổ sung field"'
         # Allow control of excluded statuses via a single list (overridable by caller)
         status_exclude = ""
         if excluded_statuses:
             excluded_statuses_jql = ", ".join(f'"{s}"' for s in excluded_statuses)
             status_exclude = f"status not in ({excluded_statuses_jql})"
-        # Tạo JQL: project AND time_clause_2 AND contextquery (chỉ lấy time_clause_2)
+        
+        # Thêm điều kiện test emails nếu có
+        test_email_filter = ""
+        if test_emails and len(test_emails) > 0:
+            email_values = ", ".join([f'"{email}"' for email in test_emails])
+            test_email_filter = f"(assignee in ({email_values}) OR reporter in ({email_values}))"
+        
+        # Tạo JQL: project AND time_clause_2 AND status_exclude AND test_email_filter (nếu có)
+        jql_parts = []
         if proj_clause:
-            jql = f"{time_clause_2} AND {status_exclude}"
-            if(contextquery):
-                jql += f" AND {contextquery}"
-            #jql = f"{proj_clause} AND {time_clause_2} AND {contextquery} AND {status_exclude}"
-        else:
-            jql = f"{time_clause_2} AND {status_exclude}"
-            if(contextquery):
-                jql += f" AND {contextquery}"
+            jql_parts.append(proj_clause)
+        jql_parts.append(time_clause_2)
+        if status_exclude:
+            jql_parts.append(status_exclude)
+        if test_email_filter:
+            jql_parts.append(test_email_filter)
+        if contextquery:
+            jql_parts.append(contextquery)
+        
+        jql = " AND ".join(jql_parts)
         jql += " ORDER BY updated DESC"
         
         fields = [
@@ -633,7 +729,14 @@ class JiraClient:
             "labels",
         ]
         try:
-            issues = self.search_issues(jql, fields=fields, expand=None, max_results=400)
+            issues = self.search_issues(
+                jql,
+                fields=fields,
+                expand=None,
+                max_results=page_size,
+                use_parallel=parallel,
+                parallel_workers=parallel_workers,
+            )
             print(f"[Jira] Found {len(issues)} tasks")
         except Exception as ex:
             self.logger.warning(f"Failed to search tasks: {ex}")
@@ -643,7 +746,7 @@ class JiraClient:
         # Chuẩn hoá tất cả tasks
         tasks: List[Dict[str, Any]] = []
         for idx, issue in enumerate(issues, 1):
-            print(f"[Jira] Chuẩn hoá task {idx}/{len(issues)}: {issue.get('key')}")
+            print(f"[Jira]  {idx}/{len(issues)}: {issue.get('key')}")
             task = self.build_task_object(issue)
             tasks.append(task)
         print(f"[Jira] Tổng tasks chuẩn hoá: {len(tasks)}")

@@ -15,6 +15,11 @@
     "9. CLOSED",
     "10. Cancelled",
     "COMPLETED"
-  ]
+  ],
+  "jira_parallel": true,
+  "jira_parallel_workers": 8,
+  "jira_page_size": 400,
+  "task_parallel": true,
+  "task_parallel_workers": 4
 }
 

@@ -1,6 +1,14 @@
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import json
 import re
+
+# Timezone Việt Nam
+VN_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+def get_vn_now() -> datetime:
+    """Lấy datetime hiện tại theo giờ Việt Nam."""
+    return datetime.now(VN_TIMEZONE)
 
 # Rule identifiers
 # Rule: Kiểm tra task ở status "READY CI TESTING" nhưng chưa có worklog sau X phút
@@ -192,7 +200,10 @@ def evaluate_missing_logtime(task, ci_testing_wait_minutes):
         except Exception:
             print("[Rules] -> hit: cannot parse last_status_changed_at")
             return MISSING_LOGTIME
-    if datetime.now(changed_at.tzinfo) - changed_at >= timedelta(minutes=ci_testing_wait_minutes):
+    now = get_vn_now()
+    if changed_at.tzinfo:
+        now = now.astimezone(changed_at.tzinfo)
+    if now - changed_at >= timedelta(minutes=ci_testing_wait_minutes):
         print("[Rules] -> hit: exceeded wait window")
         return MISSING_LOGTIME
     print("[Rules] -> no hit")
@@ -277,7 +288,7 @@ def evaluate_pre_version_reminder(task, pre_version_days):
     
     print(f"[Rules]   step 4: fixVersions has {len(fix_versions)} items -> CONTINUE")
     
-    now = datetime.now()
+    now = get_vn_now()
     print(f"[Rules]   step 5: current datetime={now}")
     print(f"[Rules]   step 5: iterate through {len(fix_versions)} fixVersions")
     
@@ -384,7 +395,7 @@ def evaluate_post_version_alert(task):
     if status_norm == "COMPLETE":
         print("[Rules] -> skip: status is Complete")
         return None
-    now = datetime.now()
+    now = get_vn_now()
     for fv in fix_versions:
         name = fv.get("name") if isinstance(fv, dict) else fv
         if not name:
@@ -464,7 +475,9 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
                 print("[Rules] -> skip: cannot parse last_assignee_changed_at")
                 return None
     
-    now = datetime.now(changed_at.tzinfo) if changed_at.tzinfo else datetime.now()
+    now = get_vn_now()
+    if changed_at.tzinfo:
+        now = now.astimezone(changed_at.tzinfo)
     time_diff = now - changed_at
     
     # Chỉ kiểm tra thay đổi trong quá khứ và trong vòng X phút
@@ -548,7 +561,7 @@ def evaluate_due_date_overdue(task):
         print(f"[Rules] evaluate_due_date_overdue END: key={task_key} -> SKIP (invalid due)")
         return None
 
-    today = datetime.now().date()
+    today = get_vn_now().date()
     print(f"[Rules]   step 3: today={today}, due_date={due_date_only}")
 
     if today > due_date_only:
@@ -624,7 +637,9 @@ def evaluate_created_recently(task, created_wait_minutes):
         print("[Rules] -> skip: cannot parse created timestamp")
         return None
 
-    now = datetime.now(created_at.tzinfo) if getattr(created_at, 'tzinfo', None) else datetime.now()
+    now = get_vn_now()
+    if getattr(created_at, 'tzinfo', None):
+        now = now.astimezone(created_at.tzinfo)
     time_diff = now - created_at
 
     if time_diff >= timedelta(0) and time_diff <= timedelta(minutes=created_wait_minutes):

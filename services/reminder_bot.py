@@ -6,11 +6,13 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List
 import pandas as pd
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
 from logger import get_logger
-from services.log_service import create_log as create_log_service
+from services.log_service import create_log as create_log_service, create_logs_batch
 from services.jira_utils import JiraClient
 from services.rules import (
      evaluate_missing_logtime,
@@ -21,6 +23,7 @@ from services.rules import (
      evaluate_due_date_overdue,
      evaluate_created_recently,
      is_test_email,
+     TEST_EMAILS,
      MISSING_LOGTIME,
      MISSING_DESCRIPTION,
      PRE_VERSION_REMINDER,
@@ -37,6 +40,13 @@ from core.config import settings
 from sqlalchemy.inspection import inspect as sa_inspect
 
 logger = get_logger()
+
+# Timezone Việt Nam
+VN_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+def get_vn_now() -> datetime:
+    """Lấy datetime hiện tại theo giờ Việt Nam."""
+    return datetime.now(VN_TIMEZONE)
 
 def _load_json(path: str) -> dict:
      with open(path, "r", encoding="utf-8") as f:
@@ -243,7 +253,7 @@ def _check_history_from_db(task_key: str, email: str, rule_code: str, resend_aft
             # Query with rule_type if the column is available; repository supports it
             logs = LogRepository(session).list_by_email_and_task("reminder_bot", email=email, task_key=task_key, rule_type=rule_code, limit=100)
         
-        now = datetime.now(timezone.utc)
+        now = get_vn_now()
         for log in logs:
             try:
                 # Prefer DB column if populated; fallback to message JSON for backward compatibility
@@ -282,13 +292,9 @@ def _already_logged_today_by_level(task_key: str, rule_code: str, level: str) ->
     This is used to avoid sending duplicate notifications within the same day.
     """
     try:
-        # Timezone context for local-day comparison
-        try:
-            tz_name = getattr(settings, "timezone", "UTC") or "UTC"
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            tz_name = "UTC"
-            tz = ZoneInfo("UTC")
+        # Timezone context for local-day comparison (giờ Việt Nam)
+        tz = VN_TIMEZONE
+        tz_name = "Asia/Ho_Chi_Minh"
         today_local = datetime.now(tz).date()
 
         print(
@@ -363,7 +369,7 @@ def _already_logged_today_by_level(task_key: str, rule_code: str, level: str) ->
                             continue
                         # Convert created_at to local tz date for same-day comparison
                         ca_local = created_at if isinstance(created_at, datetime) and created_at.tzinfo else (
-                            created_at.replace(tzinfo=timezone.utc) if isinstance(created_at, datetime) else None
+                            created_at.replace(tzinfo=VN_TIMEZONE) if isinstance(created_at, datetime) else None
                         )
                         if isinstance(ca_local, datetime):
                             ca_local = ca_local.astimezone(tz)
@@ -409,7 +415,7 @@ def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: s
      """
      logger.info(f"Checking history: task_key={task_key}, rule_code={rule_code}, to={to_value}, resend_after_hours={resend_after_hours}")
      logger.info(f"Total history rows to check: {len(history_rows)}")
-     now = datetime.now(timezone.utc)
+     now = get_vn_now()
      matched_count = 0
      for r in history_rows:
          rec_task_key = r.get("task_key")
@@ -429,7 +435,7 @@ def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: s
                      sent_at_str = sent_at_str.replace("Z", "+00:00")
                  sent_at = datetime.fromisoformat(sent_at_str) if isinstance(sent_at_str, str) else sent_at_str
                  if sent_at.tzinfo is None:
-                     sent_at = sent_at.replace(tzinfo=timezone.utc)
+                     sent_at = sent_at.replace(tzinfo=VN_TIMEZONE)
                  
                  time_diff = now - sent_at
                  hours_diff = time_diff.total_seconds() / 3600.0
@@ -567,7 +573,7 @@ def run_once():
     employees_file = os.getenv("EMPLOYEES_FILE", "employees.csv")
     history_path = os.getenv("HISTORY_FILE", "history.csv")
     #projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "FC,FSS,PPFP,FADS").split(",")) if p.strip()]
-    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "").split(",")) if p.strip()]
+    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "TADS,IPTPE,PPFP").split(",")) if p.strip()]
 
     config_path = os.path.join(os.getcwd(), "rules_config.json")
     config = _load_json(config_path) if os.path.exists(config_path) else {}
@@ -592,6 +598,10 @@ def run_once():
         "10. Cancelled",
         "COMPLETED",
     ]
+    # Parallel search controls
+    jira_parallel = bool(config.get("jira_parallel", True))
+    jira_parallel_workers = int(config.get("jira_parallel_workers", 8))
+    jira_page_size = int(config.get("jira_page_size", 400))
 
     logger.info("Starting reminder run")
     logger.debug(f"Jira URL: {jira_url}, user: {jira_user}, auth: {jira_auth_type}")
@@ -614,170 +624,291 @@ def run_once():
     print(f"[Bot] Jira ping...")
     jira.ping()
     # Fetch tasks updated recently (bao gồm CR tasks trong vòng cr_scan_days)
-    logger.info(f"Fetching tasks updated in last {schedule_minutes} minutes for projects {projects}, and CR tasks in last {cr_scan_days} days")
+    logger.info(f"Fetching tasks CR tasks in last {cr_scan_days} days")
     print(f"[Bot] Fetching tasks: last {schedule_minutes} minutes, CR tasks in last {cr_scan_days} days, projects={projects}")
-    tasks = jira.search_recent_tasks(schedule_minutes, cr_scan_days, excluded_statuses=excluded_statuses)
+    tasks = jira.search_recent_tasks(
+        schedule_minutes,
+        cr_scan_days,
+        excluded_statuses=excluded_statuses,
+        test_emails=TEST_EMAILS if TEST_EMAILS else None,
+        parallel=jira_parallel,
+        parallel_workers=jira_parallel_workers,
+        page_size=jira_page_size,
+    )
     logger.info(f"Fetched {len(tasks)} tasks")
     print(f"[Bot] Tasks fetched: {len(tasks)}")
 
     count_attempt = 0
     count_sent = 0
+    
+    # Parallel processing configuration
+    task_parallel = bool(config.get("task_parallel", True))
+    task_parallel_workers = int(config.get("task_parallel_workers", 4))
+    
+    # Thread-safe list to collect records
+    all_records = []
+    records_lock = threading.Lock()
+    print(f"[Bot] Initialized all_records list (empty)")
+    
+    def process_task(task: dict) -> List[dict]:
+        """Xử lý một task và trả về list records để lưu log."""
+        task_records = []
+        task_key = task.get('key', 'unknown')  # Define task_key ở đầu function để tránh scope issue
+        try:
+            logger.info(f"task {task.get('key')} - {task.get('summary')} - {task.get('assignee_email')} - {task.get('reporter_email')} - {task.get('status')}")
+            print(f"[Bot] Evaluate task {task.get('key')} status={task.get('status')} assignee={task.get('assignee_email')} reporter={task.get('reporter_email')}")
+            # Evaluate rules
+            findings = []  # (code, data, recipient_email)
 
-    for task in tasks:
-        logger.info(f"task {task.get('key')} - {task.get('summary')} - {task.get('assignee_email')} - {task.get('reporter_email')} - {task.get('status')}")
-        print(f"[Bot] Evaluate task {task.get('key')} status={task.get('status')} assignee={task.get('assignee_email')} reporter={task.get('reporter_email')}")
-        # Evaluate rules
-        findings = []  # (code, data, recipient_email)
+            r1 = evaluate_missing_logtime(task, ci_wait)
+            if r1:
+                logger.debug(f"Rule hit: MISSING_LOGTIME for {task.get('key')}")
+                findings.append((MISSING_LOGTIME, None, task.get("assignee_email")))
 
-        r1 = evaluate_missing_logtime(task, ci_wait)
-        if r1:
-            logger.debug(f"Rule hit: MISSING_LOGTIME for {task.get('key')}")
-            findings.append((MISSING_LOGTIME, None, task.get("assignee_email")))
+            r2 = evaluate_missing_description(task)
+            if r2:
+                logger.debug(f"Rule hit: MISSING_DESCRIPTION for {task.get('key')}")
+                findings.append((MISSING_DESCRIPTION, None, task.get("reporter_email")))
 
-        r2 = evaluate_missing_description(task)
-        if r2:
-            logger.debug(f"Rule hit: MISSING_DESCRIPTION for {task.get('key')}")
-            findings.append((MISSING_DESCRIPTION, None, task.get("reporter_email")))
+            r3 = evaluate_pre_version_reminder(task, pre_days)
+            if isinstance(r3, dict):
+                logger.debug(f"Rule hit: PRE_VERSION_REMINDER for {task.get('key')} -> {r3}")
+                findings.append((PRE_VERSION_REMINDER, r3, task.get("assignee_email")))
 
-        r3 = evaluate_pre_version_reminder(task, pre_days)
-        if isinstance(r3, dict):
-            logger.debug(f"Rule hit: PRE_VERSION_REMINDER for {task.get('key')} -> {r3}")
-            findings.append((PRE_VERSION_REMINDER, r3, task.get("assignee_email")))
+            r4 = evaluate_post_version_alert(task)
+            if isinstance(r4, dict):
+                logger.debug(f"Rule hit: POST_VERSION_ALERT for {task.get('key')} -> {r4}")
+                findings.append((POST_VERSION_ALERT, r4, task.get("assignee_email")))
 
-        r4 = evaluate_post_version_alert(task)
-        if isinstance(r4, dict):
-            # Send to assignee and leader if available; here we only handle assignee + optional reporter as leader fallback
-            logger.debug(f"Rule hit: POST_VERSION_ALERT for {task.get('key')} -> {r4}")
-            findings.append((POST_VERSION_ALERT, r4, task.get("assignee_email")))
+            # Due date overdue
+            r6 = evaluate_due_date_overdue(task)
+            if isinstance(r6, dict):
+                logger.debug(f"Rule hit: DUE_DATE_OVERDUE for {task.get('key')} -> {r6}")
+                findings.append((DUE_DATE_OVERDUE, r6, task.get("assignee_email")))
 
-        # Due date overdue
-        r6 = evaluate_due_date_overdue(task)
-        if isinstance(r6, dict):
-            logger.debug(f"Rule hit: DUE_DATE_OVERDUE for {task.get('key')} -> {r6}")
-            findings.append((DUE_DATE_OVERDUE, r6, task.get("assignee_email")))
+            # Check assignee changed - need to get changelog info first
+            if task.get("assignee_email"):
+                if task.get("last_assignee_changed_at") is None:
+                    try:
+                        changed_at = jira.get_last_assignee_change(task.get("key"))
+                        task["last_assignee_changed_at"] = changed_at
+                    except Exception as ex:
+                        logger.warning(f"Failed to get last assignee change for {task.get('key')}: {ex}")
+                        task["last_assignee_changed_at"] = None
+                
+                r5 = evaluate_assignee_changed(task, assignee_change_wait)
+                if isinstance(r5, dict):
+                    logger.debug(f"Rule hit: ASSIGNEE_CHANGED for {task.get('key')} -> {r5}")
+                    findings.append((ASSIGNEE_CHANGED, r5, task.get("assignee_email")))
 
-        # Check assignee changed - need to get changelog info first
-        # Only check if task was recently updated to avoid unnecessary API calls
-        if task.get("assignee_email"):
-            # Lazy load last_assignee_changed_at only when needed
-            if task.get("last_assignee_changed_at") is None:
+            # Recently created tasks
+            r7 = evaluate_created_recently(task, created_wait)
+            if isinstance(r7, dict):
+                logger.debug(f"Rule hit: RECENTLY_CREATED for {task.get('key')} -> {r7}")
+                findings.append((RECENTLY_CREATED, r7, task.get("assignee_email") or task.get("reporter_email")))
+
+            print(f"[Bot] Findings for {task_key}: {len(findings)}")
+            logger.info(f"Task {task_key}: found {len(findings)} findings: {[code for code, _, _ in findings]}")
+
+            # Normalize recipients and group findings by recipient
+            recipient_findings = {}
+            recipients_after_normalize = 0
+            skipped_no_recipient = 0
+            for code, data, recipient_email in findings:
+                if not recipient_email:
+                    recipient_email = task.get("reporter_email")
+                if not recipient_email:
+                    skipped_no_recipient += 1
+                    logger.debug(f"Skip send: no recipient for task {task_key} rule {code}")
+                    print(f"[Bot] Skip send {task_key} {code}: no recipient")
+                    continue
+                
+                if recipient_email not in recipient_findings:
+                    recipient_findings[recipient_email] = []
+                    recipients_after_normalize += 1
+                recipient_findings[recipient_email].append((code, data, recipient_email))
+            
+            print(f"[Bot] Task {task_key}: recipients_after_normalize={recipients_after_normalize}, skipped_no_recipient={skipped_no_recipient}")
+            logger.info(f"Task {task_key}: recipients_after_normalize={recipients_after_normalize}, skipped_no_recipient={skipped_no_recipient}")
+
+            # Send one combined message per recipient
+            skipped_test_email = 0
+            skipped_already_sent = 0
+            skipped_same_day = 0
+            messages_sent = 0
+            
+            for recipient_email, recipient_finding_list in recipient_findings.items():
+                if not is_test_email(recipient_email):
+                    skipped_test_email += 1
+                    logger.debug(f"Skip send: {recipient_email} not in test email list")
+                    print(f"[Bot] Skip send {task_key}: {recipient_email} not in test email list")
+                    continue
+                
+                # Check if any rule was already sent or same-day duplicate exists
+                should_skip = False
+                skipped_rule_code = None
+                skip_reason = ""
+                for code, data, _ in recipient_finding_list:
+                    if _already_sent(history_rows, task["key"], code, recipient_email, resend_after_hours):
+                        logger.info(f"Skip send: rule {code} for task {task_key} already sent within last {resend_after_hours}h to {recipient_email}")
+                        skipped_already_sent += 1
+                        should_skip = True
+                        skipped_rule_code = code
+                        skip_reason = f"already sent within last {resend_after_hours}h"
+                        break
+
+                    if _already_logged_today_by_level(task["key"], code, "INFO"):
+                        logger.info(f"SKIP SEND (same-day duplicate): task {task_key} rule {code} level INFO")
+                        print(f"[Bot] Skip send {task_key}: trùng rule {code} và level INFO trong ngày — chờ qua ngày báo lại sau")
+                        skipped_same_day += 1
+                        should_skip = True
+                        skipped_rule_code = code
+                        skip_reason = "same-day duplicate (rule & level)"
+                        break
+
+                if should_skip:
+                    print(f"[Bot] Skip send {task_key}: {skip_reason} for rule {skipped_rule_code} -> {recipient_email}")
+                    logger.info(f"SKIPPED: task {task_key} rule {skipped_rule_code} to {recipient_email} ({skip_reason})")
+                    continue
+
+                # Build combined message
+                if len(recipient_finding_list) == 1:
+                    code, data, _ = recipient_finding_list[0]
+                    text = build_message(task, code, data)
+                    rule_codes = [code]
+                else:
+                    text = build_combined_message(task, recipient_finding_list)
+                    rule_codes = [code for code, _, _ in recipient_finding_list]
+
+                # mapping chat id
+                chat_id = _lookup_chat_id(employees_df, recipient_email) or recipient_email
+                print(f"[Bot] Send -> task={task.get('key')} rules={rule_codes} to={recipient_email} group={chat_id if chat_id and chat_id != recipient_email else None}")
+
+                # Attempt send
+                logger.info(f"Sending combined message for {task.get('key')} rules {rule_codes} to {recipient_email} (group_id: {chat_id if chat_id and chat_id != recipient_email else None})")
+                ok, resp = send_message_fpt(
+                    chat_base_url,
+                    chat_bot_id,
+                    text,
+                    user_emails=[recipient_email] if recipient_email else None,
+                    group_id=chat_id if chat_id and chat_id != recipient_email else None,
+                )
+                if ok:
+                    messages_sent += 1
+                    logger.info(f"Sent OK for {task_key} rules {rule_codes} to {recipient_email}")
+                else:
+                    logger.warning(f"Send FAILED for {task_key} rules {rule_codes} to {recipient_email}")
+                logger.debug(f"Send response: {resp}")
+
+                # Collect records for later batch save
+                for code, data, _ in recipient_finding_list:
+                    record = {
+                        "task_key": task["key"],
+                        "rule_type": code,
+                        "to": recipient_email,
+                        "sent_at": get_vn_now().isoformat(),
+                        "status": "sent" if ok else "failed",
+                        "response": json.dumps(resp) if isinstance(resp, dict) else str(resp),
+                    }
+                    task_records.append(record)
+            
+            # Log summary for this task
+            print(f"[Bot] Task {task_key} summary: findings={len(findings)}, recipients_after_normalize={recipients_after_normalize}, skipped_test_email={skipped_test_email}, skipped_already_sent={skipped_already_sent}, skipped_same_day={skipped_same_day}, messages_sent={messages_sent}, records_created={len(task_records)}")
+            logger.info(f"Task {task_key} summary: findings={len(findings)}, recipients_after_normalize={recipients_after_normalize}, skipped_test_email={skipped_test_email}, skipped_already_sent={skipped_already_sent}, skipped_same_day={skipped_same_day}, messages_sent={messages_sent}, records_created={len(task_records)}")
+        except Exception as ex:
+            logger.exception(f"Error processing task {task_key}: {ex}")
+            print(f"[Bot] ERROR processing task {task_key}: {ex}")
+        
+        print(f"[Bot] process_task({task_key}) returning {len(task_records)} records")
+        logger.debug(f"process_task({task_key}) returning {len(task_records)} records: {[r.get('rule_type') for r in task_records]}")
+        return task_records
+
+    # Process tasks in parallel or sequentially
+    if task_parallel and len(tasks) > 1:
+        print(f"[Bot] Processing {len(tasks)} tasks in parallel with {task_parallel_workers} workers")
+        logger.info(f"Processing {len(tasks)} tasks in parallel with {task_parallel_workers} workers")
+        
+        with ThreadPoolExecutor(max_workers=task_parallel_workers) as executor:
+            futures = {executor.submit(process_task, task): task for task in tasks}
+            completed = 0
+            for future in as_completed(futures):
+                task = futures[future]
                 try:
-                    changed_at = jira.get_last_assignee_change(task.get("key"))
-                    task["last_assignee_changed_at"] = changed_at
+                    records = future.result()
+                    print(f"[Bot] future.result() for task {task.get('key')}: type={type(records)}, value={records}")
+                    logger.debug(f"future.result() for task {task.get('key')}: type={type(records)}, len={len(records) if isinstance(records, list) else 'N/A'}, records={records}")
+                    if records is None:
+                        records = []
+                        print(f"[Bot] WARNING: task {task.get('key')} returned None, converted to empty list")
+                    if not isinstance(records, list):
+                        print(f"[Bot] WARNING: task {task.get('key')} returned non-list type {type(records)}, converting to list")
+                        records = list(records) if records else []
+                    with records_lock:
+                        before_count = len(all_records)
+                        all_records.extend(records)
+                        after_count = len(all_records)
+                    completed += 1
+                    count_attempt += len([r for r in records if r.get("status") == "sent" or r.get("status") == "failed"])
+                    count_sent += len([r for r in records if r.get("status") == "sent"])
                 except Exception as ex:
-                    logger.warning(f"Failed to get last assignee change for {task.get('key')}: {ex}")
-                    task["last_assignee_changed_at"] = None
+                    logger.exception(f"Error in parallel task processing for {task.get('key', 'unknown')}: {ex}")
+                    print(f"[Bot] ERROR in parallel task processing for {task.get('key', 'unknown')}: {ex}")
+    else:
+        print(f"[Bot] Processing {len(tasks)} tasks sequentially")
+        logger.info(f"Processing {len(tasks)} tasks sequentially")
+        for task in tasks:
+            records = process_task(task)
+            all_records.extend(records)
+            count_attempt += len([r for r in records if r.get("status") == "sent" or r.get("status") == "failed"])
+            count_sent += len([r for r in records if r.get("status") == "sent"])
+
+    # Batch save all records to DB after processing all tasks
+    print(f"[Bot] Total tasks processed: {len(tasks)}, Total records collected: {len(all_records)}")
+    logger.info(f"Total tasks processed: {len(tasks)}, Total records collected: {len(all_records)}")
+    print(f"[Bot] Saving {len(all_records)} records to DB...")
+    logger.info(f"Batch saving {len(all_records)} records to DB")
+    
+    # Save to CSV (legacy support)
+    for record in all_records:
+        _append_history(history_path, record)
+    
+    # Batch insert to DB
+    if all_records:
+        try:
+            # Convert records to format for batch insert
+            batch_records = []
+            for record in all_records:
+                level = "INFO" if record.get("status") == "sent" else "WARNING"
+                message = json.dumps(record, ensure_ascii=False)
+                email = record.get("to") or record.get("email")
+                task_key = record.get("task_key")
+                rule_type = record.get("rule_type")
+                
+                batch_records.append({
+                    "level": level,
+                    "source": "reminder_bot",
+                    "message": message,
+                    "email": email,
+                    "task_key": task_key,
+                    "rule_type": rule_type,
+                })
             
-            r5 = evaluate_assignee_changed(task, assignee_change_wait)
-            if isinstance(r5, dict):
-                logger.debug(f"Rule hit: ASSIGNEE_CHANGED for {task.get('key')} -> {r5}")
-                findings.append((ASSIGNEE_CHANGED, r5, task.get("assignee_email")))
-
-        # Recently created tasks (independent of assignee existence)
-        r7 = evaluate_created_recently(task, created_wait)
-        if isinstance(r7, dict):
-            logger.debug(f"Rule hit: RECENTLY_CREATED for {task.get('key')} -> {r7}")
-            findings.append((RECENTLY_CREATED, r7, task.get("assignee_email") or task.get("reporter_email")))
-
-        print(f"[Bot] Findings for {task.get('key')}: {len(findings)}")
-
-        # Normalize recipients and group findings by recipient
-        recipient_findings = {}  # recipient_email -> list of (code, data, recipient_email)
-        for code, data, recipient_email in findings:
-            if not recipient_email:
-                recipient_email = task.get("reporter_email")
-            if not recipient_email:
-                logger.debug(f"Skip send: no recipient for task {task.get('key')} rule {code}")
-                print(f"[Bot] Skip send {task.get('key')} {code}: no recipient")
-                continue
-            
-            if recipient_email not in recipient_findings:
-                recipient_findings[recipient_email] = []
-            recipient_findings[recipient_email].append((code, data, recipient_email))
-
-        # Send one combined message per recipient
-        for recipient_email, recipient_finding_list in recipient_findings.items():
-            # Filter: chỉ test với các email trong danh sách test (nếu có)
-            if not is_test_email(recipient_email):
-                logger.debug(f"Skip send: {recipient_email} not in test email list")
-                print(f"[Bot] Skip send {task.get('key')}: {recipient_email} not in test email list")
-                continue
-            
-            # Check if any rule was already sent or same-day duplicate exists
-            # Logic: nếu đã gửi trong vòng X giờ (resend_after_hours) hoặc đã có log cùng ngày (cùng rule & level), skip
-            should_skip = False
-            skipped_rule_code = None
-            skip_reason = ""
-            for code, data, _ in recipient_finding_list:
-                if _already_sent(history_rows, task["key"], code, recipient_email, resend_after_hours):
-                    logger.info(f"Skip send: rule {code} for task {task.get('key')} already sent within last {resend_after_hours}h to {recipient_email}")
-                    should_skip = True
-                    skipped_rule_code = code
-                    skip_reason = f"already sent within last {resend_after_hours}h"
-                    break
-
-                # New rule: if same-day log exists with same rule_type, task_key and level (INFO), skip sending
-                if _already_logged_today_by_level(task["key"], code, "INFO"):
-                    logger.info(
-                        f"SKIP SEND (same-day duplicate): task {task.get('key')} rule {code} level INFO"
-                    )
-                    print(
-                        f"[Bot] Skip send {task.get('key')}: trùng rule {code} và level INFO trong ngày — chờ qua ngày báo lại sau"
-                    )
-                    should_skip = True
-                    skipped_rule_code = code
-                    skip_reason = "same-day duplicate (rule & level)"
-                    break
-
-            if should_skip:
-                print(f"[Bot] Skip send {task.get('key')}: {skip_reason} for rule {skipped_rule_code} -> {recipient_email}")
-                logger.info(f"SKIPPED: task {task.get('key')} rule {skipped_rule_code} to {recipient_email} ({skip_reason})")
-                continue
-
-            # Build combined message
-            if len(recipient_finding_list) == 1:
-                # Single rule - use original message format
-                code, data, _ = recipient_finding_list[0]
-                text = build_message(task, code, data)
-                rule_codes = [code]
-            else:
-                # Multiple rules - use combined format
-                text = build_combined_message(task, recipient_finding_list)
-                rule_codes = [code for code, _, _ in recipient_finding_list]
-
-            # mapping chat id
-            chat_id = _lookup_chat_id(employees_df, recipient_email) or recipient_email
-            print(f"[Bot] Send -> task={task.get('key')} rules={rule_codes} to={recipient_email} group={chat_id if chat_id and chat_id != recipient_email else None}")
-
-            # Attempt send: try by email first; if fails, fallback to groupId (from employees.csv chat_id column)
-            logger.info(f"Sending combined message for {task.get('key')} rules {rule_codes} to {recipient_email} (group_id: {chat_id if chat_id and chat_id != recipient_email else None})")
-            ok, resp = send_message_fpt(
-                chat_base_url,
-                chat_bot_id,
-                text,
-                user_emails=[recipient_email] if recipient_email else None,
-                group_id=chat_id if chat_id and chat_id != recipient_email else None,
-            )
-            count_attempt += 1
-            if ok:
-                count_sent += 1
-                logger.info(f"Sent OK for {task.get('key')} rules {rule_codes} to {recipient_email}")
-            else:
-                logger.warning(f"Send FAILED for {task.get('key')} rules {rule_codes} to {recipient_email}")
-            logger.debug(f"Send response: {resp}")
-
-            # Log history for each rule (to track individual rule sends)
-            for code, data, _ in recipient_finding_list:
-                record = {
-                    "task_key": task["key"],
-                    "rule_type": code,
-                    "to": recipient_email,
-                    "sent_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "sent" if ok else "failed",
-                    "response": json.dumps(resp) if isinstance(resp, dict) else str(resp),
-                }
-                _append_history(history_path, record)
-                _append_history_service(record)
+            # Batch insert
+            create_logs_batch(batch_records)
+            print(f"[Bot] Batch inserted {len(batch_records)} records to DB")
+            logger.info(f"Batch inserted {len(batch_records)} records to DB")
+        except Exception as ex:
+            logger.exception(f"Failed to batch insert records: {ex}")
+            print(f"[Bot] ERROR: Failed to batch insert records: {ex}")
+            # Fallback: insert one by one
+            logger.info("Falling back to individual inserts")
+            for record in all_records:
+                try:
+                    _append_history_service(record)
+                except Exception as ex2:
+                    logger.warning(f"Failed to insert individual record: {ex2}")
+    
+    print(f"[Bot] Saved {len(all_records)} records to DB")
 
     logger.info(f"Attempts: {count_attempt}, Sent: {count_sent}")
 

@@ -1,11 +1,19 @@
 from __future__ import annotations
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from db.session import get_session
 from db.repositories.employee_repo import EmployeeRepository
 from db.repositories.reminder_repo import ReminderRepository
 from services.jira_service import JiraService
 from services.chat_service import ChatService
+
+# Timezone Việt Nam
+VN_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+def get_vn_now() -> datetime:
+    """Lấy datetime hiện tại theo giờ Việt Nam."""
+    return datetime.now(VN_TIMEZONE)
 
 
 class ReminderService:
@@ -40,14 +48,14 @@ class ReminderService:
                 employee_id = username_to_id[username]
                 issue_key = t.get("issue_key", "")
                 message = t.get("message", f"Reminder for {issue_key}")
-                due_at = t.get("due_at") or datetime.now(timezone.utc)
+                due_at = t.get("due_at") or get_vn_now()
                 rem_repo.create(employee_id, issue_key, message, due_at)
                 synced += 1
 
         return synced
 
     async def send_due_reminders(self) -> int:
-        now = datetime.utcnow()
+        now = get_vn_now()
         sent = 0
         with get_session() as session:
             rem_repo = ReminderRepository(session)
