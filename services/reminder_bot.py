@@ -18,12 +18,16 @@ from services.rules import (
      evaluate_pre_version_reminder,
      evaluate_post_version_alert,
      evaluate_assignee_changed,
+     evaluate_due_date_overdue,
+     evaluate_created_recently,
      is_test_email,
      MISSING_LOGTIME,
      MISSING_DESCRIPTION,
      PRE_VERSION_REMINDER,
      POST_VERSION_ALERT,
      ASSIGNEE_CHANGED,
+     DUE_DATE_OVERDUE,
+     RECENTLY_CREATED,
 )
 from services.chat_api import send_message_fpt
 from db.session import get_session
@@ -490,6 +494,18 @@ def build_message(task: dict, code: str, data: Optional[dict] = None) -> str:
             f" 💪 👉 {url}"
         )
     
+    if code == DUE_DATE_OVERDUE and data:
+        return (
+            f"⏳ Task [{key}] - {summary} đã quá hạn due date ({data.get('due_date')}) "
+            f"{data.get('days_overdue')} ngày rồi ạ. Mình xử lý giúp em nhé 👉 {url}"
+        )
+
+    if code == RECENTLY_CREATED and data:
+        return (
+            f"🆕 Task [{key}] - {summary} vừa được tạo gần đây (created: {data.get('created_at')}). "
+            f"Mời anh/chị vào xem và bắt đầu xử lý nha 👉 {url}"
+        )
+    
     return f"ℹ️ Task [{key}] - {summary}: {url}"
 
 def build_combined_message(task: dict, findings: List[Tuple[str, Optional[dict], str]]) -> str:
@@ -518,6 +534,14 @@ def build_combined_message(task: dict, findings: List[Tuple[str, Optional[dict],
             )
         elif code == ASSIGNEE_CHANGED and data:
             messages.append("👋 Bé bot báo nè! Task này vừa được gán cho anh/chị đó 💪.")
+        elif code == DUE_DATE_OVERDUE and data:
+            messages.append(
+                f"⏳ Task đã quá hạn due date ({data.get('due_date')}) {data.get('days_overdue')} ngày."
+            )
+        elif code == RECENTLY_CREATED and data:
+            messages.append(
+                f"🆕 Task vừa được tạo (created: {data.get('created_at')}). Mời vào xem cho nóng nha!"
+            )
 
     if messages:
         combined = (
@@ -553,9 +577,21 @@ def run_once():
     resend_after_hours = int(config.get("resend_after_hours", 3))
     # Rule 1 window: consider tasks assigned within last 60 minutes by default
     assignee_change_wait = int(config.get("assignee_change_wait_minutes", 60))
+    # Recently created window: default to same as assignee_change_wait
+    created_wait = int(config.get("created_wait_minutes", assignee_change_wait))
     domains_allowed = config.get("domains_allowed", ["FRT"])
     # CR scan days: quét CR tasks trong vòng X ngày
     cr_scan_days = int(config.get("cr_scan_days", 1))
+    # Excluded statuses for search (configurable)
+    excluded_statuses = config.get("excluded_statuses") or [
+        "5. Golive",
+        "Closed",
+        "Cancel",
+        "Rejected",
+        "9. CLOSED",
+        "10. Cancelled",
+        "COMPLETED",
+    ]
 
     logger.info("Starting reminder run")
     logger.debug(f"Jira URL: {jira_url}, user: {jira_user}, auth: {jira_auth_type}")
@@ -580,7 +616,7 @@ def run_once():
     # Fetch tasks updated recently (bao gồm CR tasks trong vòng cr_scan_days)
     logger.info(f"Fetching tasks updated in last {schedule_minutes} minutes for projects {projects}, and CR tasks in last {cr_scan_days} days")
     print(f"[Bot] Fetching tasks: last {schedule_minutes} minutes, CR tasks in last {cr_scan_days} days, projects={projects}")
-    tasks = jira.search_recent_tasks(schedule_minutes, cr_scan_days)
+    tasks = jira.search_recent_tasks(schedule_minutes, cr_scan_days, excluded_statuses=excluded_statuses)
     logger.info(f"Fetched {len(tasks)} tasks")
     print(f"[Bot] Tasks fetched: {len(tasks)}")
 
@@ -614,6 +650,12 @@ def run_once():
             logger.debug(f"Rule hit: POST_VERSION_ALERT for {task.get('key')} -> {r4}")
             findings.append((POST_VERSION_ALERT, r4, task.get("assignee_email")))
 
+        # Due date overdue
+        r6 = evaluate_due_date_overdue(task)
+        if isinstance(r6, dict):
+            logger.debug(f"Rule hit: DUE_DATE_OVERDUE for {task.get('key')} -> {r6}")
+            findings.append((DUE_DATE_OVERDUE, r6, task.get("assignee_email")))
+
         # Check assignee changed - need to get changelog info first
         # Only check if task was recently updated to avoid unnecessary API calls
         if task.get("assignee_email"):
@@ -630,6 +672,12 @@ def run_once():
             if isinstance(r5, dict):
                 logger.debug(f"Rule hit: ASSIGNEE_CHANGED for {task.get('key')} -> {r5}")
                 findings.append((ASSIGNEE_CHANGED, r5, task.get("assignee_email")))
+
+        # Recently created tasks (independent of assignee existence)
+        r7 = evaluate_created_recently(task, created_wait)
+        if isinstance(r7, dict):
+            logger.debug(f"Rule hit: RECENTLY_CREATED for {task.get('key')} -> {r7}")
+            findings.append((RECENTLY_CREATED, r7, task.get("assignee_email") or task.get("reporter_email")))
 
         print(f"[Bot] Findings for {task.get('key')}: {len(findings)}")
 

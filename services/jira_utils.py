@@ -89,7 +89,7 @@ class JiraClient:
                     print(f"[Jira] Đã lấy tất cả projects từ Jira: {', '.join(self.projects)}")
                 else:
                     # Fallback nếu không lấy được
-                    self.projects = ["FC", "FSS", "PKT", "WAK", "PPFP"]
+                    self.projects = []
                     print(f"[Jira] Không lấy được projects từ Jira, dùng mặc định: {', '.join(self.projects)}")
             except Exception as ex:
                 # Fallback nếu có lỗi
@@ -195,15 +195,17 @@ class JiraClient:
         """Lấy tất cả project keys từ Jira."""
         try:
             print("[Jira] Đang lấy danh sách tất cả projects từ Jira...")
-            resp = self._request("GET", "/rest/api/2/project")
-            if resp.status_code != 200:
-                self.logger.warning(f"get_all_projects failed: {resp.status_code} - {resp.text[:200]}")
-                return []
-            projects_data = resp.json()
-            project_keys = [p.get("key", "").upper() for p in projects_data if p.get("key")]
-            project_keys = [p for p in project_keys if p]  # Loại bỏ empty strings
-            print(f"[Jira] Lấy được {len(project_keys)} projects: {', '.join(project_keys)}")
-            return project_keys
+            #đoạn code lấy thông tin project từ Jira
+            #resp = self._request("GET", "/rest/api/2/project")
+            #if resp.status_code != 200:
+                #self.logger.warning(f"get_all_projects failed: {resp.status_code} - {resp.text[:200]}")
+                #return []
+            #projects_data = resp.json()
+            #project_keys = [p.get("key", "").upper() for p in projects_data if p.get("key")]
+            #project_keys = [p for p in project_keys if p]  # Loại bỏ empty strings
+            #print(f"[Jira] Lấy được {len(project_keys)} projects: {', '.join(project_keys)}")
+            #return project_keys
+            return []
         except Exception as ex:
             self.logger.warning(f"get_all_projects error: {ex}")
             print(f"[Jira] Lỗi khi lấy danh sách projects: {ex}")
@@ -493,6 +495,7 @@ class JiraClient:
         summary = fields.get("summary", "")
         status = self._safe_get(fields, ["status", "name"], "")
         updated = fields.get("updated", "")
+        created_raw = fields.get("created", "")
         issue_type = self._safe_get(fields, ["issuetype", "name"], "")
         priority = self._safe_get(fields, ["priority", "name"], "")
         project_key = self._safe_get(fields, ["project", "key"], "").upper()
@@ -522,6 +525,7 @@ class JiraClient:
             "summary": summary,
             "status": status,
             "updated": self._format_iso(updated),
+            "created": created_raw,
             "type": issue_type,
             "priority": priority,
             "project": project_key,
@@ -546,6 +550,8 @@ class JiraClient:
         task["reporter_email"] = reporter.get("emailAddress") or ""
         task["task_url"] = task["link"]
         task["description"] = fields.get("description")
+        # Due date (Jira format YYYY-MM-DD)
+        task["duedate"] = fields.get("duedate")
         # Status last changed time (ISO)
         last_status_change = fields.get("statuscategorychangedate") or ""
         task["last_status_changed_at"] = last_status_change
@@ -577,7 +583,7 @@ class JiraClient:
     # -----------------------------
     # Convenience for reminder_bot
     # -----------------------------
-    def search_recent_tasks(self, minutes: int, cr_scan_days: int = 3) -> List[Dict[str, Any]]:
+    def search_recent_tasks(self, minutes: int, cr_scan_days: int = 3, excluded_statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Tìm tasks cập nhật trong X phút gần đây hoặc CR tasks trong vòng X ngày.
         Gộp thành 1 query duy nhất: (tasks updated in minutes) OR (CR tasks updated in cr_scan_days)
         """
@@ -587,23 +593,32 @@ class JiraClient:
         else:
             proj_clause = ""
         
-        # Gộp thành 1 query: (tasks updated in minutes) OR (CR tasks updated in cr_scan_days)
-        time_clause_1 = f"updated >= -{int(minutes)}m"
-        #cr_filter = "(issuetype = 'Code Review' OR summary ~ 'CR' OR labels = 'CR')"
         cr_filter = ""
         time_clause_2 = f"updated >= -{int(cr_scan_days)}d"
-        contextquery = 'text ~ "test api hangnt60"'
+        contextquery = ''
+        #contextquery = 'text ~ "CLONE - Review và fix lại số liệu back-up để đảm bảo không vượt quá 20-30TB dự kiến"'
+        # Allow control of excluded statuses via a single list (overridable by caller)
+        status_exclude = ""
+        if excluded_statuses:
+            excluded_statuses_jql = ", ".join(f'"{s}"' for s in excluded_statuses)
+            status_exclude = f"status not in ({excluded_statuses_jql})"
         # Tạo JQL: project AND time_clause_2 AND contextquery (chỉ lấy time_clause_2)
         if proj_clause:
-            jql = f"{proj_clause} AND {time_clause_2} AND {contextquery}"
+            jql = f"{time_clause_2} AND {status_exclude}"
+            if(contextquery):
+                jql += f" AND {contextquery}"
+            #jql = f"{proj_clause} AND {time_clause_2} AND {contextquery} AND {status_exclude}"
         else:
-            jql = f"{time_clause_2} AND {contextquery}"
+            jql = f"{time_clause_2} AND {status_exclude}"
+            if(contextquery):
+                jql += f" AND {contextquery}"
         jql += " ORDER BY updated DESC"
         
         fields = [
             "summary",
             "status",
             "updated",
+            "created",
             "issuetype",
             "priority",
             "project",
@@ -613,10 +628,10 @@ class JiraClient:
             "reporter",
             "description",
             "fixVersions",
+            "duedate",
             "statuscategorychangedate",
             "labels",
         ]
-        print(f"[Jira] Query: Tasks updated in last {minutes} minutes OR CR tasks in last {cr_scan_days} days")
         try:
             issues = self.search_issues(jql, fields=fields, expand=None, max_results=400)
             print(f"[Jira] Found {len(issues)} tasks")

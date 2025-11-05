@@ -18,20 +18,48 @@ POST_VERSION_ALERT = "post_version_alert"
 # Rule: Cảnh báo khi assignee được thay đổi trong vòng X phút gần đây
 ASSIGNEE_CHANGED = "assignee_changed"
 
+# Rule: Cảnh báo task quá hạn due date
+DUE_DATE_OVERDUE = "due_date_overdue"
+
+# Rule: Cảnh báo task mới được tạo trong vòng X phút gần đây
+RECENTLY_CREATED = "recently_created"
+
 # Test email list - chỉ test với các email này (tạm thời)
 TEST_EMAILS = [
-
+    "hangnt60@fpt.com",
+    "nhutlm1@fpt.com",
+    "haovtm2@fpt.com",
+    "tuttc8@fpt.com",
+    "phucnvh6@fpt.com",
+    "quyennt94@fpt.com",
+    "loinp5@fpt.com",
+    "kieuntd@fpt.com",
+    "minhnlv2@fpt.com"
 ]
 TEST_MODE_ENABLED = len(TEST_EMAILS) > 0  # Chỉ bật test mode khi có email trong danh sách; rỗng = chạy all
 
 # Cấu hình project bị loại trừ cho từng rule
 # Mỗi rule có thể có danh sách project không được áp dụng rule đó
 RULE_EXCLUDED_PROJECTS = {
-    MISSING_LOGTIME: ["IPTPE"],  # Ví dụ: ["FC", "FSS"] - rule này sẽ không chạy với tasks thuộc project FC và FSS
+    MISSING_LOGTIME: ["IPTPE,TADS"],  # Ví dụ: ["FC", "FSS"] - rule này sẽ không chạy với tasks thuộc project FC và FSS
     MISSING_DESCRIPTION: [],
-    PRE_VERSION_REMINDER: ["IPTPE"],
-    POST_VERSION_ALERT: ["IPTPE"],
+    PRE_VERSION_REMINDER: ["IPTPE,TADS"],
+    POST_VERSION_ALERT: ["IPTPE,TADS"],
     ASSIGNEE_CHANGED: [],
+    DUE_DATE_OVERDUE: [],
+    RECENTLY_CREATED: [],
+}
+
+# Cấu hình project được phép áp dụng (whitelist) cho từng rule
+# Nếu danh sách rỗng -> áp dụng cho tất cả project (mặc định)
+RULE_INCLUDED_PROJECTS = {
+    MISSING_LOGTIME: [],
+    MISSING_DESCRIPTION: [],
+    PRE_VERSION_REMINDER: [],
+    POST_VERSION_ALERT: [],
+    ASSIGNEE_CHANGED: [],
+    DUE_DATE_OVERDUE: ["IPTPE,TADS"],
+    RECENTLY_CREATED: [],
 }
 
 
@@ -55,6 +83,22 @@ def is_project_excluded(project: str, rule_code: str) -> bool:
     project_upper = str(project).strip().upper()
     excluded_upper = [p.upper() for p in excluded_projects]
     return project_upper in excluded_upper
+
+
+def is_project_allowed(project: str, rule_code: str) -> bool:
+    """Kiểm tra project có nằm trong danh sách cho phép (nếu có cấu hình) của rule không.
+    - Nếu danh sách allow rỗng: cho phép tất cả (trả về True)
+    - Nếu có danh sách: chỉ cho phép project nằm trong danh sách
+    """
+    included_projects = RULE_INCLUDED_PROJECTS.get(rule_code, [])
+    # Không cấu hình -> allow all
+    if not included_projects:
+        return True
+    if not project:
+        return False
+    project_upper = str(project).strip().upper()
+    included_upper = [p.upper() for p in included_projects]
+    return project_upper in included_upper
 
 
 def is_test_email(email: str) -> bool:
@@ -119,6 +163,9 @@ def _parse_date_from_fixversion_name(name: str):
 def evaluate_missing_logtime(task, ci_testing_wait_minutes):
     _log_task_preview("[Rules] evaluate_missing_logtime input:", task)
     project_key = task.get('project')
+    if not is_project_allowed(project_key, MISSING_LOGTIME):
+        print(f"[Rules] evaluate_missing_logtime: project {project_key} is not allowed -> SKIP")
+        return None
     if is_project_excluded(project_key, MISSING_LOGTIME):
         print(f"[Rules] evaluate_missing_logtime: project {project_key} is excluded -> SKIP")
         return None
@@ -155,6 +202,9 @@ def evaluate_missing_logtime(task, ci_testing_wait_minutes):
 def evaluate_missing_description(task):
     _log_task_preview("[Rules] evaluate_missing_description input:", task)
     project_key = task.get('project')
+    if not is_project_allowed(project_key, MISSING_DESCRIPTION):
+        print(f"[Rules] evaluate_missing_description: project {project_key} is not allowed -> SKIP")
+        return None
     if is_project_excluded(project_key, MISSING_DESCRIPTION):
         print(f"[Rules] evaluate_missing_description: project {project_key} is excluded -> SKIP")
         return None
@@ -185,6 +235,9 @@ def evaluate_missing_description(task):
 def evaluate_pre_version_reminder(task, pre_version_days):
     _log_task_preview("[Rules] evaluate_pre_version_reminder input:", task)
     project_key = task.get('project')
+    if not is_project_allowed(project_key, PRE_VERSION_REMINDER):
+        print(f"[Rules] evaluate_pre_version_reminder: project {project_key} is not allowed -> SKIP")
+        return None
     if is_project_excluded(project_key, PRE_VERSION_REMINDER):
         print(f"[Rules] evaluate_pre_version_reminder: project {project_key} is excluded -> SKIP")
         return None
@@ -313,6 +366,9 @@ def evaluate_pre_version_reminder(task, pre_version_days):
 def evaluate_post_version_alert(task):
     _log_task_preview("[Rules] evaluate_post_version_alert input:", task)
     project_key = task.get('project')
+    if not is_project_allowed(project_key, POST_VERSION_ALERT):
+        print(f"[Rules] evaluate_post_version_alert: project {project_key} is not allowed -> SKIP")
+        return None
     if is_project_excluded(project_key, POST_VERSION_ALERT):
         print(f"[Rules] evaluate_post_version_alert: project {project_key} is excluded -> SKIP")
         return None
@@ -379,6 +435,9 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
     """
     _log_task_preview("[Rules] evaluate_assignee_changed input:", task)
     project_key = task.get('project')
+    if not is_project_allowed(project_key, ASSIGNEE_CHANGED):
+        print(f"[Rules] evaluate_assignee_changed: project {project_key} is not allowed -> SKIP")
+        return None
     if is_project_excluded(project_key, ASSIGNEE_CHANGED):
         print(f"[Rules] evaluate_assignee_changed: project {project_key} is excluded -> SKIP")
         return None
@@ -418,4 +477,163 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
         }
     
     print("[Rules] -> no hit: change too old")
+    return None
+
+
+def evaluate_due_date_overdue(task):
+    """
+    Kiểm tra task có quá hạn due date không.
+    Hỗ trợ các key due date phổ biến: 'duedate', 'dueDate', 'due_date', 'due'.
+    - So sánh theo ngày (date-only), không xét time.
+    - Trả về dict kèm số ngày trễ hạn nếu quá hạn, ngược lại trả về None.
+    """
+    _log_task_preview("[Rules] evaluate_due_date_overdue input:", task)
+    project_key = task.get('project')
+    if not is_project_allowed(project_key, DUE_DATE_OVERDUE):
+        print(f"[Rules] evaluate_due_date_overdue: project {project_key} is not allowed -> SKIP")
+        return None
+    if is_project_excluded(project_key, DUE_DATE_OVERDUE):
+        print(f"[Rules] evaluate_due_date_overdue: project {project_key} is excluded -> SKIP")
+        return None
+
+    task_key = task.get('key')
+    print(f"[Rules] evaluate_due_date_overdue START: key={task_key} project={project_key}")
+
+    # Lấy due date với các key khả dĩ
+    due_keys = ["duedate", "dueDate", "due_date", "due"]
+    due_raw = None
+    for k in due_keys:
+        if k in task and task.get(k) is not None:
+            due_raw = task.get(k)
+            print(f"[Rules]   step 1: found due date with key '{k}' -> {repr(due_raw)}")
+            break
+
+    if due_raw is None:
+        print(f"[Rules]   step 1: no due date found -> SKIP")
+        print(f"[Rules] evaluate_due_date_overdue END: key={task_key} -> SKIP (no due)")
+        return None
+
+    # Chuẩn hóa về date (yyyy-mm-dd)
+    due_date_only = None
+    try:
+        if isinstance(due_raw, datetime):
+            due_date_only = due_raw.date()
+            print(f"[Rules]   step 2: due is datetime -> use date {due_date_only}")
+        elif getattr(due_raw, "__class__", None) and due_raw.__class__.__name__ == "date":
+            # Là kiểu date
+            due_date_only = due_raw
+            print(f"[Rules]   step 2: due is date -> {due_date_only}")
+        elif isinstance(due_raw, str):
+            s = due_raw.strip()
+            print(f"[Rules]   step 2: due is str={repr(s)}")
+            # Ưu tiên định dạng Jira 'YYYY-MM-DD'
+            try:
+                due_date_only = datetime.strptime(s[:10], "%Y-%m-%d").date()
+                print(f"[Rules]   step 2: parsed with %Y-%m-%d -> {due_date_only}")
+            except Exception:
+                try:
+                    # Thử ISO khác, nếu là datetime ISO thì lấy .date()
+                    dt = datetime.fromisoformat(s)
+                    due_date_only = dt.date()
+                    print(f"[Rules]   step 2: parsed with fromisoformat -> {due_date_only}")
+                except Exception as e:
+                    print(f"[Rules]   step 2: cannot parse due string -> {e}")
+        else:
+            print(f"[Rules]   step 2: unsupported due type={type(due_raw)} -> cannot parse")
+    except Exception as e:
+        print(f"[Rules]   step 2: unexpected error while parsing due -> {e}")
+
+    if not due_date_only:
+        print(f"[Rules]   step 3: no valid due date after parsing -> SKIP")
+        print(f"[Rules] evaluate_due_date_overdue END: key={task_key} -> SKIP (invalid due)")
+        return None
+
+    today = datetime.now().date()
+    print(f"[Rules]   step 3: today={today}, due_date={due_date_only}")
+
+    if today > due_date_only:
+        days_overdue = (today - due_date_only).days
+        print(f"[Rules] -> hit: task is overdue by {days_overdue} day(s)")
+        print(f"[Rules] evaluate_due_date_overdue END: key={task_key} -> HIT")
+        return {
+            "code": DUE_DATE_OVERDUE,
+            "due_date": due_date_only.isoformat(),
+            "days_overdue": days_overdue,
+        }
+
+    print(f"[Rules] -> no hit: not overdue")
+    print(f"[Rules] evaluate_due_date_overdue END: key={task_key} -> NO HIT")
+    return None
+
+
+def evaluate_created_recently(task, created_wait_minutes):
+    """
+    Kiểm tra nếu task được tạo trong vòng X phút gần đây.
+    Lấy thời gian tạo từ các key phổ biến: 'created', 'created_at', 'createdAt'.
+    """
+    _log_task_preview("[Rules] evaluate_created_recently input:", task)
+    project_key = task.get('project')
+    if not is_project_allowed(project_key, RECENTLY_CREATED):
+        print(f"[Rules] evaluate_created_recently: project {project_key} is not allowed -> SKIP")
+        return None
+    if is_project_excluded(project_key, RECENTLY_CREATED):
+        print(f"[Rules] evaluate_created_recently: project {project_key} is excluded -> SKIP")
+        return None
+
+    created_keys = ["created", "created_at", "createdAt"]
+    created_at_str = None
+    for k in created_keys:
+        v = task.get(k)
+        if v:
+            created_at_str = v
+            print(f"[Rules]   step 1: found created with key '{k}' -> {repr(v)}")
+            break
+
+    if not created_at_str:
+        print("[Rules] -> skip: no created timestamp")
+        return None
+
+    # Parse created_at
+    created_at = None
+    try:
+        if isinstance(created_at_str, datetime):
+            created_at = created_at_str
+            print(f"[Rules]   step 2: created is datetime -> {created_at}")
+        elif isinstance(created_at_str, str):
+            s = created_at_str.strip()
+            print(f"[Rules]   step 2: created is str={repr(s)} -> try multiple formats")
+            try:
+                created_at = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f%z")
+            except Exception:
+                try:
+                    created_at = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
+                except Exception:
+                    try:
+                        created_at = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+                    except Exception:
+                        try:
+                            created_at = datetime.fromisoformat(s)
+                        except Exception as e:
+                            print(f"[Rules]   step 2: cannot parse created -> {e}")
+        else:
+            print(f"[Rules]   step 2: unsupported created type={type(created_at_str)}")
+    except Exception as e:
+        print(f"[Rules]   step 2: unexpected error while parsing created -> {e}")
+
+    if not created_at:
+        print("[Rules] -> skip: cannot parse created timestamp")
+        return None
+
+    now = datetime.now(created_at.tzinfo) if getattr(created_at, 'tzinfo', None) else datetime.now()
+    time_diff = now - created_at
+
+    if time_diff >= timedelta(0) and time_diff <= timedelta(minutes=created_wait_minutes):
+        minutes_ago = time_diff.total_seconds() / 60
+        print(f"[Rules] -> hit: task created {minutes_ago:.1f}m ago")
+        return {
+            "code": RECENTLY_CREATED,
+            "created_at": created_at_str if isinstance(created_at_str, str) else created_at.isoformat(),
+        }
+
+    print("[Rules] -> no hit: created too old or in the future")
     return None

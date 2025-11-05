@@ -5,6 +5,16 @@
   "domains_allowed": ["FRT", "FSOFT"],
   "resend_after_hours": 8,
   "assignee_change_wait_minutes": 5,
-  "cr_scan_days": 3
+  "created_wait_minutes": 5,
+  "cr_scan_days": 3,
+  "excluded_statuses": [
+    "5. Golive",
+    "Closed",
+    "Cancel",
+    "Rejected",
+    "9. CLOSED",
+    "10. Cancelled",
+    "COMPLETED"
+  ]
 }
 
