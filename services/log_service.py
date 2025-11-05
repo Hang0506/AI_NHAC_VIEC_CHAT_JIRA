@@ -8,12 +8,12 @@ from db.repositories.log_repo import LogRepository
 from db.models.log import Log
 
 
-def create_log(level: str, source: str, message: str, session: Optional[Session] = None) -> Log:
+def create_log(level: str, source: str, message: str, email: str | None = None, task_key: str | None = None, session: Optional[Session] = None) -> Log:
     """Create a log record. If session is not provided, a new one is created."""
     if session is not None:
-        return LogRepository(session).add(level=level, source=source, message=message)
+        return LogRepository(session).add(level=level, source=source, message=message, email=email, task_key=task_key)
 
     with get_session() as _session:
-        return LogRepository(_session).add(level=level, source=source, message=message)
+        return LogRepository(_session).add(level=level, source=source, message=message, email=email, task_key=task_key)
 
 

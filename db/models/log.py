@@ -11,3 +11,5 @@ class Log(Base):
     source: Mapped[str] = mapped_column(String(100), index=True)
     message: Mapped[str] = mapped_column(Text())
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    task_key: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)

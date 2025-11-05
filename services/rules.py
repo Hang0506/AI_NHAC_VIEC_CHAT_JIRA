@@ -1,12 +1,75 @@
 from datetime import datetime, timedelta
 import json
+import re
 
 # Rule identifiers
+# Rule: Kiểm tra task ở status "READY CI TESTING" nhưng chưa có worklog sau X phút
 MISSING_LOGTIME = "missing_logtime"
+
+# Rule: Kiểm tra task không có description hoặc description rỗng
 MISSING_DESCRIPTION = "missing_description"
+
+# Rule: Nhắc nhở trước khi release - task có fixVersion và ngày release trong vòng X ngày tới
 PRE_VERSION_REMINDER = "pre_version_reminder"
+
+# Rule: Cảnh báo sau khi release - ngày release đã qua nhưng task chưa ở status Complete
 POST_VERSION_ALERT = "post_version_alert"
+
+# Rule: Cảnh báo khi assignee được thay đổi trong vòng X phút gần đây
 ASSIGNEE_CHANGED = "assignee_changed"
+
+# Test email list - chỉ test với các email này (tạm thời)
+TEST_EMAILS = [
+
+]
+TEST_MODE_ENABLED = len(TEST_EMAILS) > 0  # Chỉ bật test mode khi có email trong danh sách
+
+# Cấu hình project bị loại trừ cho từng rule
+# Mỗi rule có thể có danh sách project không được áp dụng rule đó
+RULE_EXCLUDED_PROJECTS = {
+    MISSING_LOGTIME: ["IPTPE"],  # Ví dụ: ["FC", "FSS"] - rule này sẽ không chạy với tasks thuộc project FC và FSS
+    MISSING_DESCRIPTION: [],
+    PRE_VERSION_REMINDER: ["IPTPE"],
+    POST_VERSION_ALERT: ["IPTPE"],
+    ASSIGNEE_CHANGED: [],
+}
+
+
+def is_project_excluded(project: str, rule_code: str) -> bool:
+    """Kiểm tra project có bị loại trừ cho rule không.
+    
+    Args:
+        project: Project key của task (ví dụ: "FC", "FSS")
+        rule_code: Mã rule (ví dụ: MISSING_LOGTIME)
+    
+    Returns:
+        True nếu project bị loại trừ (rule không chạy), False nếu không
+    """
+    if not project:
+        return False
+    
+    excluded_projects = RULE_EXCLUDED_PROJECTS.get(rule_code, [])
+    if not excluded_projects:
+        return False
+    
+    project_upper = str(project).strip().upper()
+    excluded_upper = [p.upper() for p in excluded_projects]
+    return project_upper in excluded_upper
+
+
+def is_test_email(email: str) -> bool:
+    """Kiểm tra email có trong danh sách test không.
+    Nếu TEST_EMAILS không trống, chỉ cho phép email trong danh sách.
+    Nếu TEST_EMAILS trống, không cho phép gì cả (đang test/giả lập).
+    """
+    if not email:
+        return False
+    # Nếu danh sách test trống, không cho phép gì cả
+    if not TEST_EMAILS:
+        return False
+    # Chỉ cho phép email trong danh sách test
+    email_lower = email.strip().lower()
+    return any(test_email.lower() == email_lower for test_email in TEST_EMAILS)
 
 
 def _log_task_preview(prefix, task):
@@ -21,11 +84,47 @@ def _log_task_preview(prefix, task):
     print(f"{prefix} task_preview={preview}")
 
 
+def _parse_date_from_fixversion_name(name: str):
+    """
+    Parse date từ tên fixVersion.
+    Tên có dạng: "ICT release/20251112-v2.1.2.45" hoặc "release/20251105-v8.14.4-lc"
+    Trả về datetime object nếu tìm thấy, None nếu không.
+    """
+    if not name:
+        print(f"[Rules] _parse_date_from_fixversion_name: name is empty")
+        return None
+    
+    # Normalize: strip whitespace và convert to string
+    name_str = str(name).strip()
+    print(f"[Rules] _parse_date_from_fixversion_name: searching pattern in name={repr(name_str)}")
+    
+    # Tìm pattern 8 chữ số liên tiếp (YYYYMMDD)
+    match = re.search(r'(\d{8})', name_str)
+    if not match:
+        print(f"[Rules] _parse_date_from_fixversion_name: no 8-digit pattern found in {repr(name_str)}")
+        return None
+    
+    date_str = match.group(1)  # YYYYMMDD
+    print(f"[Rules] _parse_date_from_fixversion_name: found date_str={repr(date_str)}")
+    try:
+        # Parse YYYYMMDD thành datetime
+        release_date = datetime.strptime(date_str, "%Y%m%d")
+        print(f"[Rules] _parse_date_from_fixversion_name: parsed successfully -> {release_date}")
+        return release_date
+    except Exception as e:
+        print(f"[Rules] _parse_date_from_fixversion_name: parsing failed -> {e}")
+        return None
+
+
 def evaluate_missing_logtime(task, ci_testing_wait_minutes):
     _log_task_preview("[Rules] evaluate_missing_logtime input:", task)
+    project_key = task.get('project')
+    if is_project_excluded(project_key, MISSING_LOGTIME):
+        print(f"[Rules] evaluate_missing_logtime: project {project_key} is excluded -> SKIP")
+        return None
     status_raw = task.get('status')
     status_norm = (status_raw or "").strip().upper()
-    print(f"[Rules] evaluate_missing_logtime: key={task.get('key')} status={status_raw} (norm={status_norm}) has_worklog={task.get('has_worklog')} last_status_changed_at={task.get('last_status_changed_at')} wait={ci_testing_wait_minutes}m")
+    print(f"[Rules] evaluate_missing_logtime: key={task.get('key')} project={project_key} status={status_raw} (norm={status_norm}) has_worklog={task.get('has_worklog')} last_status_changed_at={task.get('last_status_changed_at')} wait={ci_testing_wait_minutes}m")
     # Chấp nhận các biến thể như "READY CI TESTING", "IN CI TESTING"...
     if "READY CI TESTING" not in status_norm:
         print("[Rules] -> skip: status does not contain 'CI TESTING'")
@@ -55,62 +154,180 @@ def evaluate_missing_logtime(task, ci_testing_wait_minutes):
 
 def evaluate_missing_description(task):
     _log_task_preview("[Rules] evaluate_missing_description input:", task)
+    project_key = task.get('project')
+    if is_project_excluded(project_key, MISSING_DESCRIPTION):
+        print(f"[Rules] evaluate_missing_description: project {project_key} is excluded -> SKIP")
+        return None
+    task_key = task.get('key')
+    print(f"[Rules] evaluate_missing_description START: key={task_key} project={project_key}")
+    
     description = task.get("description")
-    print(f"[Rules] evaluate_missing_description: key={task.get('key')} has_desc={bool(description and str(description).strip())}")
-    if description is None or str(description).strip() == "":
-        print("[Rules] -> hit: missing description")
+    print(f"[Rules]   step 1: get description from task")
+    print(f"[Rules]   step 1: description type={type(description)}")
+    print(f"[Rules]   step 1: description raw={repr(description)}")
+    
+    if description is None:
+        print(f"[Rules]   step 2: description is None -> HIT")
+        print(f"[Rules] evaluate_missing_description END: key={task_key} -> one HIT")
         return MISSING_DESCRIPTION
-    print("[Rules] -> no hit")
+    
+    description_str = str(description)
+    print(f"[Rules]   step 2: convert to string -> {repr(description_str)}")
+    
+    description_stripped = description_str.strip()
+    print(f"[Rules]   step 3: strip whitespace -> {repr(description_stripped)}")
+    print(f"[Rules]   step 3: length after strip={len(description_stripped)}")
+    
+    if description_stripped == "":
+        print(f"[Rules]   step 4: description is empty string -> HIT")
+        print(f"[Rules] evaluate_missing_description END: key={task_key} -> HIT (empty)")
+        return MISSING_DESCRIPTION
+    
+    print(f"[Rules]   step 4: description has content -> NO HIT")
+    print(f"[Rules] evaluate_missing_description END: key={task_key} -> NO HIT")
     return None
 
 
 def evaluate_pre_version_reminder(task, pre_version_days):
     _log_task_preview("[Rules] evaluate_pre_version_reminder input:", task)
+    project_key = task.get('project')
+    if is_project_excluded(project_key, PRE_VERSION_REMINDER):
+        print(f"[Rules] evaluate_pre_version_reminder: project {project_key} is excluded -> SKIP")
+        return None
+    task_key = task.get('key')
+    print(f"[Rules] evaluate_pre_version_reminder START: key={task_key} project={project_key} pre_version_days={pre_version_days}")
+    
     # Need fixVersion dates and ensure status not in UAT phases
-    fix_versions = task.get("fixVersions") or []
-    fv_dates = task.get("fixVersion_dates") or {}
+    fix_versions_raw = task.get("fixVersions")
+    print(f"[Rules]   step 1: get fixVersions from task")
+    print(f"[Rules]   step 1: fixVersions type={type(fix_versions_raw)}")
+    print(f"[Rules]   step 1: fixVersions raw={repr(fix_versions_raw)}")
+    
+    fix_versions = fix_versions_raw or []
+    print(f"[Rules]   step 1: fixVersions normalized (or []): {repr(fix_versions)}")
+    print(f"[Rules]   step 1: fixVersions count={len(fix_versions)}")
+    
+    fv_dates_raw = task.get("fixVersion_dates")
+    print(f"[Rules]   step 2: get fixVersion_dates from task")
+    print(f"[Rules]   step 2: fixVersion_dates type={type(fv_dates_raw)}")
+    print(f"[Rules]   step 2: fixVersion_dates raw={repr(fv_dates_raw)}")
+    
+    fv_dates = fv_dates_raw or {}
+    print(f"[Rules]   step 2: fixVersion_dates normalized (or {{}}): {repr(fv_dates)}")
+    
     status_raw = task.get("status")
+    print(f"[Rules]   step 3: get status from task")
+    print(f"[Rules]   step 3: status raw={repr(status_raw)}")
+    
     status_norm = (status_raw or "").strip().upper()
-    print(f"[Rules] evaluate_pre_version_reminder: key={task.get('key')} fv_count={len(fix_versions)} status={status_raw} (norm={status_norm}) pre_days={pre_version_days}")
+    print(f"[Rules]   step 3: status normalized={repr(status_norm)}")
+    
+    print(f"[Rules]   step 4: check if fixVersions is empty")
     if not fix_versions:
-        print("[Rules] -> skip: no fixVersions")
+        print(f"[Rules]   step 4: fixVersions is empty -> SKIP")
+        print(f"[Rules] evaluate_pre_version_reminder END: key={task_key} -> SKIP (no fixVersions)")
         return None
-    # Skip if already in UAT phases
-    if status_norm in {"UAT", "UAT TESTING"}:
-        print("[Rules] -> skip: status is UAT/UAT TESTING")
-        return None
+    
+    print(f"[Rules]   step 4: fixVersions has {len(fix_versions)} items -> CONTINUE")
+    
     now = datetime.now()
-    for fv in fix_versions:
-        name = fv.get("name") if isinstance(fv, dict) else fv
-        date_str = fv_dates.get(name)
-        if not date_str:
-            print(f"[Rules]   skip fv '{name}': no releaseDate")
+    print(f"[Rules]   step 5: current datetime={now}")
+    print(f"[Rules]   step 5: iterate through {len(fix_versions)} fixVersions")
+    
+    # Các status cần kiểm tra khi release trong 2 ngày tới
+    deploy_uat_statuses = {"DEPLOYING", "UAT", "UAT TESTING", "READY UAT"}
+    print(f"[Rules]   step 5: deploy_uat_statuses={deploy_uat_statuses}")
+    print(f"[Rules]   step 5: current status_norm={repr(status_norm)}")
+    
+    for idx, fv in enumerate(fix_versions):
+        print(f"[Rules]     fixVersion[{idx}]: processing fv={repr(fv)}")
+        print(f"[Rules]     fixVersion[{idx}]: fv type={type(fv)}")
+        
+        if isinstance(fv, dict):
+            name = fv.get("name")
+            print(f"[Rules]     fixVersion[{idx}]: is dict, get name -> {repr(name)}")
+        else:
+            name = fv
+            print(f"[Rules]     fixVersion[{idx}]: is not dict, use as name -> {repr(name)}")
+        
+        if not name:
+            print(f"[Rules]     fixVersion[{idx}]: name is empty -> SKIP")
             continue
-        try:
-            release_date = datetime.fromisoformat(date_str)
-        except Exception:
-            print(f"[Rules]   skip fv '{name}': invalid releaseDate={date_str}")
-            continue
-        days_until = (release_date - now).days
-        if 0 <= days_until <= pre_version_days:
-            print(f"[Rules] -> hit: fv={name} days_until={days_until}")
+        
+        print(f"[Rules]     fixVersion[{idx}]: parsing date from name={repr(name)}")
+        release_date = _parse_date_from_fixversion_name(name)
+        print(f"[Rules]     fixVersion[{idx}]: parsed date={repr(release_date)}")
+        
+        if not release_date:
+            print(f"[Rules]     fixVersion[{idx}]: cannot parse date from name '{name}' -> SKIP")
+            # Fallback: thử lấy từ fv_dates nếu có
+            date_str = fv_dates.get(name)
+            if date_str:
+                print(f"[Rules]     fixVersion[{idx}]: trying fallback from fv_dates={repr(date_str)}")
+                try:
+                    release_date = datetime.fromisoformat(date_str)
+                    print(f"[Rules]     fixVersion[{idx}]: fallback parsed successfully -> {release_date}")
+                except Exception as e:
+                    print(f"[Rules]     fixVersion[{idx}]: fallback parsing failed -> {e}")
+                    print(f"[Rules]     fixVersion[{idx}]: no valid releaseDate -> SKIP")
+                    continue
+            else:
+                print(f"[Rules]     fixVersion[{idx}]: no releaseDate -> SKIP")
+                continue
+        
+        print(f"[Rules]     fixVersion[{idx}]: calculating days_until")
+        print(f"[Rules]     fixVersion[{idx}]: release_date={release_date}, now={now}")
+        # Tính days_until theo date, không theo datetime
+        now_date = now.date()
+        release_date_only = release_date.date()
+        days_until = (release_date_only - now_date).days
+        print(f"[Rules]     fixVersion[{idx}]: now_date={now_date}, release_date_only={release_date_only}, days_until={days_until}")
+        
+        # Kiểm tra: nếu release trong khoảng từ 0 đến 2 ngày tới VÀ status không phải là DEPLOYING/UAT/READY UAT thì gửi remind
+        if 0 <= days_until <= 2:
+            print(f"[Rules]     fixVersion[{idx}]: release trong 2 ngày tới (days={days_until})")
+            if status_norm not in deploy_uat_statuses:
+                print(f"[Rules]     fixVersion[{idx}]: status={repr(status_norm)} KHÔNG trong {deploy_uat_statuses} -> HIT (gửi remind)")
+                print(f"[Rules] evaluate_pre_version_reminder END: key={task_key} -> HIT (fv={name}, days={days_until}, status={status_norm})")
+                return {
+                    "code": PRE_VERSION_REMINDER,
+                    "fv_name": name,
+                    "days": days_until,
+                    "status": status_norm,
+                }
+            else:
+                print(f"[Rules]     fixVersion[{idx}]: status={repr(status_norm)} đang trong {deploy_uat_statuses} -> SKIP (không cần remind)")
+        
+        # Logic cũ: kiểm tra nếu days_until <= pre_version_days (cho các trường hợp khác)
+        print(f"[Rules]     fixVersion[{idx}]: checking if {days_until} <= {pre_version_days}")
+        if 0 < days_until <= pre_version_days:
+            print(f"[Rules]     fixVersion[{idx}]: condition met -> HIT")
+            print(f"[Rules] evaluate_pre_version_reminder END: key={task_key} -> HIT (fv={name}, days={days_until})")
             return {
                 "code": PRE_VERSION_REMINDER,
                 "fv_name": name,
                 "days": days_until,
             }
-    print("[Rules] -> no hit")
+        else:
+            print(f"[Rules]     fixVersion[{idx}]: condition not met -> CONTINUE")
+    
+    print(f"[Rules]   step 6: no fixVersion matched -> NO HIT")
+    print(f"[Rules] evaluate_pre_version_reminder END: key={task_key} -> NO HIT")
     return None
 
 
 def evaluate_post_version_alert(task):
     _log_task_preview("[Rules] evaluate_post_version_alert input:", task)
+    project_key = task.get('project')
+    if is_project_excluded(project_key, POST_VERSION_ALERT):
+        print(f"[Rules] evaluate_post_version_alert: project {project_key} is excluded -> SKIP")
+        return None
     # After release date and status not Complete
     fix_versions = task.get("fixVersions") or []
     fv_dates = task.get("fixVersion_dates") or {}
     status_raw = task.get("status")
     status_norm = (status_raw or "").strip().upper()
-    print(f"[Rules] evaluate_post_version_alert: key={task.get('key')} fv_count={len(fix_versions)} status={status_raw} (norm={status_norm})")
+    print(f"[Rules] evaluate_post_version_alert: key={task.get('key')} project={project_key} fv_count={len(fix_versions)} status={status_raw} (norm={status_norm})")
     if not fix_versions:
         print("[Rules] -> skip: no fixVersions")
         return None
@@ -121,16 +338,37 @@ def evaluate_post_version_alert(task):
     now = datetime.now()
     for fv in fix_versions:
         name = fv.get("name") if isinstance(fv, dict) else fv
-        date_str = fv_dates.get(name)
-        if not date_str:
-            print(f"[Rules]   skip fv '{name}': no releaseDate")
+        if not name:
+            print(f"[Rules]   skip fv: name is empty")
             continue
-        try:
-            release_date = datetime.fromisoformat(date_str)
-        except Exception:
-            print(f"[Rules]   skip fv '{name}': invalid releaseDate={date_str}")
-            continue
-        if now > release_date:
+        
+        # Ưu tiên parse date từ tên fixVersion
+        release_date = _parse_date_from_fixversion_name(name)
+        
+        if not release_date:
+            # Fallback: thử lấy từ fv_dates nếu có
+            print(f"[Rules]   cannot parse date from name, trying fallback from fv_dates")
+            date_str = fv_dates.get(name)
+            if date_str:
+                print(f"[Rules]   fallback date_str={repr(date_str)}")
+                try:
+                    release_date = datetime.fromisoformat(date_str)
+                    print(f"[Rules]   fallback parsed successfully -> {release_date}")
+                except Exception as e:
+                    print(f"[Rules]   fallback parsing failed -> {e}")
+                    print(f"[Rules]   skip fv '{name}': no valid releaseDate")
+                    continue
+            else:
+                print(f"[Rules]   skip fv '{name}': no releaseDate")
+                continue
+
+        print(f"[Rules]   comparing: now={now}, release_date={release_date}")
+        print(f"[Rules]   comparing: now type={type(now)}, release_date type={type(release_date)}")
+        # So sánh chỉ phần date, không so sánh time
+        now_date = now.date()
+        release_date_only = release_date.date()
+        print(f"[Rules]   comparing dates: now_date={now_date}, release_date_only={release_date_only}")
+        if now_date > release_date_only:
             print(f"[Rules] -> hit: past release date for {name}")
             return {
                 "code": POST_VERSION_ALERT,
@@ -147,8 +385,12 @@ def evaluate_assignee_changed(task, assignee_change_wait_minutes):
     Cần có last_assignee_changed_at trong task (lấy từ changelog).
     """
     _log_task_preview("[Rules] evaluate_assignee_changed input:", task)
+    project_key = task.get('project')
+    if is_project_excluded(project_key, ASSIGNEE_CHANGED):
+        print(f"[Rules] evaluate_assignee_changed: project {project_key} is excluded -> SKIP")
+        return None
     assignee_email = task.get("assignee_email")
-    print(f"[Rules] evaluate_assignee_changed: key={task.get('key')} assignee={assignee_email} wait={assignee_change_wait_minutes}m")
+    print(f"[Rules] evaluate_assignee_changed: key={task.get('key')} project={project_key} assignee={assignee_email} wait={assignee_change_wait_minutes}m")
     
     if not assignee_email:
         print("[Rules] -> skip: no assignee")

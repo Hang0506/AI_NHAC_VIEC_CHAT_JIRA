@@ -17,6 +17,7 @@ from services.rules import (
      evaluate_pre_version_reminder,
      evaluate_post_version_alert,
      evaluate_assignee_changed,
+     is_test_email,
      MISSING_LOGTIME,
      MISSING_DESCRIPTION,
      PRE_VERSION_REMINDER,
@@ -71,22 +72,66 @@ def _lookup_chat_id(df: pd.DataFrame, email: str) -> str:
      logger.debug(f"Mapped email {email} -> chat_id '{chat_id}'")
      return chat_id if isinstance(chat_id, str) else ""
 
-def _load_history(path: str):
+def _load_history(path: str, email: str | None = None, task_key: str | None = None):
      """Load reminder send history from DB logs (source='reminder_bot').
+     Can filter by email and/or task_key.
      The CSV file is ignored to avoid parsing issues.
      """
      try:
+         logger.info(f"Loading history from DB: email={email}, task_key={task_key}")
          with get_session() as session:
-             logs = LogRepository(session).list_by_source("reminder_bot", limit=5000)
+             if email or task_key:
+                 logs = LogRepository(session).list_by_email_and_task("reminder_bot", email=email, task_key=task_key, limit=5000)
+                 logger.info(f"Query by email/task_key: found {len(logs)} logs from DB")
+             else:
+                 logs = LogRepository(session).list_by_source("reminder_bot", limit=5000)
+                 logger.info(f"Query all: found {len(logs)} logs from DB")
          rows = []
          for log in logs:
              try:
-                 rec = json.loads(getattr(log, "message", ""))
-                 if isinstance(rec, dict) and rec.get("task_key") and rec.get("rule_type") and rec.get("to"):
+                 # Use email and task_key from DB columns if available, otherwise parse from message
+                 rec = {}
+                 log_email = getattr(log, "email", None)
+                 log_task_key = getattr(log, "task_key", None)
+                 log_created_at = getattr(log, "created_at", None)
+                 
+                 if log_email and log_task_key:
+                     # Use DB columns directly
+                     rec = {
+                         "task_key": log_task_key,
+                         "to": log_email,
+                         "sent_at": log_created_at.isoformat() if hasattr(log_created_at, "isoformat") else str(log_created_at),
+                     }
+                     logger.debug(f"Using DB columns: task_key={log_task_key}, email={log_email}, created_at={log_created_at}")
+                     # Try to parse message for additional fields
+                     try:
+                         msg_data = json.loads(getattr(log, "message", "{}"))
+                         if isinstance(msg_data, dict):
+                             rec.update(msg_data)
+                             logger.debug(f"Parsed message: {json.dumps(msg_data, ensure_ascii=False)}")
+                     except Exception as ex:
+                         logger.debug(f"Failed to parse message: {ex}")
+                 else:
+                     # Fallback: parse from message (backward compatible)
+                     rec = json.loads(getattr(log, "message", ""))
+                     logger.debug(f"Using message fallback: {json.dumps(rec, ensure_ascii=False)}")
+                 
+                 if isinstance(rec, dict) and rec.get("task_key") and rec.get("to"):
+                     # Use email and task_key from DB if available
+                     if log_email:
+                         rec["to"] = log_email
+                         logger.debug(f"Updated rec['to'] from DB: {log_email}")
+                     if log_task_key:
+                         rec["task_key"] = log_task_key
+                         logger.debug(f"Updated rec['task_key'] from DB: {log_task_key}")
                      rows.append(rec)
-             except Exception:
+                     logger.debug(f"Added history record: task_key={rec.get('task_key')}, to={rec.get('to')}, rule_type={rec.get('rule_type')}, sent_at={rec.get('sent_at')}")
+             except Exception as ex:
+                 logger.warning(f"Failed to parse log record: {ex}")
                  continue
-         logger.info(f"Loaded reminder history from DB: {len(rows)} records")
+         logger.info(f"Loaded reminder history from DB: {len(rows)} records (email={email}, task_key={task_key})")
+         if rows:
+             logger.info(f"Sample history records: {json.dumps(rows[:3], ensure_ascii=False, indent=2)}")
          return rows
      except Exception as ex:
          logger.exception(f"Failed to load history from DB: {ex}")
@@ -117,21 +162,89 @@ def _append_history_service(record: dict):
     try:
         level = "INFO" if record.get("status") == "sent" else "WARNING"
         message = json.dumps(record, ensure_ascii=False)
-        create_log_service(level=level, source="reminder_bot", message=message)
+        email = record.get("to") or record.get("email")
+        task_key = record.get("task_key")
+        create_log_service(level=level, source="reminder_bot", message=message, email=email, task_key=task_key)
     except Exception as ex:
         logger.exception(f"Failed to write history via service: {ex}")
 
+def _check_history_from_db(task_key: str, email: str, rule_code: str, resend_after_hours: int) -> bool:
+    """Check history directly from DB by task_key and email.
+    Returns True if already sent within resend_after_hours, False otherwise.
+    """
+    try:
+        with get_session() as session:
+            logs = LogRepository(session).list_by_email_and_task("reminder_bot", email=email, task_key=task_key, limit=100)
+        
+        now = datetime.now(timezone.utc)
+        for log in logs:
+            try:
+                # Parse message to get rule_type
+                msg_data = json.loads(getattr(log, "message", "{}"))
+                if isinstance(msg_data, dict) and msg_data.get("rule_type") == rule_code:
+                    # Check sent_at from message or created_at
+                    sent_at_str = msg_data.get("sent_at") or (getattr(log, "created_at").isoformat() if hasattr(getattr(log, "created_at"), "isoformat") else str(getattr(log, "created_at")))
+                    sent_at = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
+                    time_diff = now - sent_at
+                    if time_diff < timedelta(hours=resend_after_hours):
+                        logger.debug(f"Found recent history: {task_key} {rule_code} to {email} ({time_diff.total_seconds()/3600:.1f}h ago)")
+                        return True
+            except Exception:
+                continue
+        return False
+    except Exception as ex:
+        logger.warning(f"Failed to check history from DB: {ex}")
+        return False
+
 def _already_sent(history_rows: list, task_key: str, rule_code: str, to_value: str, resend_after_hours: int) -> bool:
+     """Kiểm tra xem đã gửi nhắc trong vòng X giờ chưa.
+     Returns True nếu đã gửi trong vòng X giờ (để skip, không gửi lại).
+     Returns False nếu chưa gửi hoặc đã gửi quá X giờ (cho phép gửi lại).
+     """
+     logger.info(f"Checking history: task_key={task_key}, rule_code={rule_code}, to={to_value}, resend_after_hours={resend_after_hours}")
+     logger.info(f"Total history rows to check: {len(history_rows)}")
      now = datetime.now(timezone.utc)
+     matched_count = 0
      for r in history_rows:
-         if r.get("task_key") == task_key and r.get("rule_type") == rule_code and r.get("to") == to_value:
+         rec_task_key = r.get("task_key")
+         rec_rule_type = r.get("rule_type")
+         rec_to = r.get("to")
+         rec_sent_at = r.get("sent_at")
+         
+         logger.debug(f"Checking record: task_key={rec_task_key}, rule_type={rec_rule_type}, to={rec_to}, sent_at={rec_sent_at}")
+         
+         if rec_task_key == task_key and rec_rule_type == rule_code and rec_to == to_value:
+             matched_count += 1
+             logger.info(f"Found matching record #{matched_count}: task_key={rec_task_key}, rule_type={rec_rule_type}, to={rec_to}, sent_at={rec_sent_at}")
              try:
-                 sent_at = datetime.fromisoformat(r.get("sent_at"))
-             except Exception:
-                 return True
-             if now - sent_at < timedelta(hours=resend_after_hours):
-                 logger.debug(f"Skip send: recently sent for {task_key} {rule_code} to {to_value}")
-                 return True
+                 # Parse sent_at, handle both ISO format and datetime string
+                 sent_at_str = rec_sent_at
+                 if isinstance(sent_at_str, str):
+                     sent_at_str = sent_at_str.replace("Z", "+00:00")
+                 sent_at = datetime.fromisoformat(sent_at_str) if isinstance(sent_at_str, str) else sent_at_str
+                 if sent_at.tzinfo is None:
+                     sent_at = sent_at.replace(tzinfo=timezone.utc)
+                 
+                 time_diff = now - sent_at
+                 hours_diff = time_diff.total_seconds() / 3600.0
+                 logger.info(f"Time difference: {hours_diff:.2f} hours (threshold: {resend_after_hours} hours)")
+                 
+                 # Nếu đã gửi trong vòng X giờ, return True để skip (không gửi lại)
+                 if time_diff < timedelta(hours=resend_after_hours):
+                     logger.info(f"SKIP SEND: Already sent {hours_diff:.2f}h ago (within {resend_after_hours}h threshold) for {task_key} {rule_code} to {to_value}")
+                     return True
+                 else:
+                     logger.info(f"ALLOW SEND: Last sent {hours_diff:.2f}h ago (over {resend_after_hours}h threshold) for {task_key} {rule_code} to {to_value}")
+             except Exception as ex:
+                 # Nếu không parse được, log warning và coi như chưa gửi (cho phép gửi lại)
+                 logger.warning(f"Failed to parse sent_at '{rec_sent_at}' for record: {ex}, allowing send")
+                 continue
+     
+     if matched_count == 0:
+         logger.info(f"NO MATCH: No history found for task_key={task_key}, rule_code={rule_code}, to={to_value}, allowing send")
+     else:
+         logger.info(f"Checked {matched_count} matching records, all were over threshold, allowing send")
+     
      return False
 
 def build_message(task: dict, code: str, data: Optional[dict] = None) -> str:
@@ -226,9 +339,9 @@ def run_once():
     chat_bot_id = os.getenv("FPT_CHAT_BOT_ID", "")
     schedule_minutes = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "15"))
     employees_file = os.getenv("EMPLOYEES_FILE", "employees.csv")
+    history_path = os.getenv("HISTORY_FILE", "history.csv")
     #projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "FC,FSS,PPFP,FADS").split(",")) if p.strip()]
-    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "PPFP,FADS").split(",")) if p.strip()]
-    history_path = os.getenv("REMINDER_HISTORY_FILE", "data/reminder_logs.csv")
+    projects = [p.strip() for p in (os.getenv("JIRA_PROJECTS", "").split(",")) if p.strip()]
 
     config_path = os.path.join(os.getcwd(), "rules_config.json")
     config = _load_json(config_path) if os.path.exists(config_path) else {}
@@ -239,25 +352,33 @@ def run_once():
     # Rule 1 window: consider tasks assigned within last 60 minutes by default
     assignee_change_wait = int(config.get("assignee_change_wait_minutes", 60))
     domains_allowed = config.get("domains_allowed", ["FRT"])
+    # CR scan days: quét CR tasks trong vòng X ngày
+    cr_scan_days = int(config.get("cr_scan_days", 1))
 
     logger.info("Starting reminder run")
     logger.debug(f"Jira URL: {jira_url}, user: {jira_user}, auth: {jira_auth_type}")
     logger.debug(f"Projects: {projects}, schedule_minutes: {schedule_minutes}")
-    logger.debug(f"Config -> ci_wait: {ci_wait} min, pre_days: {pre_days}, resend_after_hours: {resend_after_hours}, assignee_change_wait: {assignee_change_wait} min")
-    logger.debug(f"Employees file: {employees_file}, history path: {history_path}")
+    logger.debug(f"Config -> ci_wait: {ci_wait} min, pre_days: {pre_days}, resend_after_hours: {resend_after_hours}, assignee_change_wait: {assignee_change_wait} min, cr_scan_days: {cr_scan_days} days")
+
+    # Load employees mapping from DB
+    logger.info("Loading employees mapping from DB")
+    employees_df = _read_employees(employees_file)
+    logger.info(f"Loaded {len(employees_df)} employees from DB")
+
+    # Load history from DB
+    logger.info("Loading reminder history from DB")
+    history_rows = _load_history(history_path)
+    logger.info(f"Loaded {len(history_rows)} history records from DB")
 
     # Prepare services
     jira = JiraClient(jira_url, jira_user, jira_token, projects, auth_type=jira_auth_type)
     # Ping để xác nhận kết nối Jira
     print(f"[Bot] Jira ping...")
     jira.ping()
-    employees_df = _read_employees(employees_file)
-    history_rows = _load_history(history_path)
-
-    # Fetch tasks updated recently
-    logger.info(f"Fetching tasks updated in last {schedule_minutes} minutes for projects {projects}")
-    print(f"[Bot] Fetching tasks: last {schedule_minutes} minutes, projects={projects}")
-    tasks = jira.search_recent_tasks(schedule_minutes)
+    # Fetch tasks updated recently (bao gồm CR tasks trong vòng cr_scan_days)
+    logger.info(f"Fetching tasks updated in last {schedule_minutes} minutes for projects {projects}, and CR tasks in last {cr_scan_days} days")
+    print(f"[Bot] Fetching tasks: last {schedule_minutes} minutes, CR tasks in last {cr_scan_days} days, projects={projects}")
+    tasks = jira.search_recent_tasks(schedule_minutes, cr_scan_days)
     logger.info(f"Fetched {len(tasks)} tasks")
     print(f"[Bot] Tasks fetched: {len(tasks)}")
 
@@ -326,17 +447,27 @@ def run_once():
 
         # Send one combined message per recipient
         for recipient_email, recipient_finding_list in recipient_findings.items():
+            # Filter: chỉ test với các email trong danh sách test (nếu có)
+            if not is_test_email(recipient_email):
+                logger.debug(f"Skip send: {recipient_email} not in test email list")
+                print(f"[Bot] Skip send {task.get('key')}: {recipient_email} not in test email list")
+                continue
+            
             # Check if any rule was already sent (use first rule for dedup check)
-            # Note: We check if ALL rules were sent, if any was sent recently, skip this recipient
+            # Logic: nếu đã gửi trong vòng X giờ (resend_after_hours), skip (không gửi lại)
+            # Nếu chưa gửi hoặc đã gửi quá X giờ, cho phép gửi
             should_skip = False
+            skipped_rule_code = None
             for code, data, _ in recipient_finding_list:
                 if _already_sent(history_rows, task["key"], code, recipient_email, resend_after_hours):
-                    logger.debug(f"Skip send: rule {code} for task {task.get('key')} already sent within last {resend_after_hours}h to {recipient_email}")
+                    logger.info(f"Skip send: rule {code} for task {task.get('key')} already sent within last {resend_after_hours}h to {recipient_email}")
                     should_skip = True
+                    skipped_rule_code = code
                     break
             
             if should_skip:
                 print(f"[Bot] Skip send {task.get('key')}: already sent to {recipient_email} within last {resend_after_hours}h")
+                logger.info(f"SKIPPED: task {task.get('key')} rule {skipped_rule_code} to {recipient_email} (already sent within {resend_after_hours}h)")
                 continue
 
             # Build combined message

@@ -82,9 +82,20 @@ class JiraClient:
         # Cached project list for convenience in reminder flows
         self.projects = [p.strip().upper() for p in (projects or []) if p and p.strip()]
         if not self.projects:
-            # Mặc định bao gồm PPFP
-            self.projects = ["FC", "FSS", "PKT", "WAK", "PPFP"]
-            print(f"[Jira] Không có danh sách projects, dùng mặc định: {', '.join(self.projects)}")
+            # Tự động lấy tất cả projects từ Jira
+            try:
+                self.projects = self.get_all_projects()
+                if self.projects:
+                    print(f"[Jira] Đã lấy tất cả projects từ Jira: {', '.join(self.projects)}")
+                else:
+                    # Fallback nếu không lấy được
+                    self.projects = ["FC", "FSS", "PKT", "WAK", "PPFP"]
+                    print(f"[Jira] Không lấy được projects từ Jira, dùng mặc định: {', '.join(self.projects)}")
+            except Exception as ex:
+                # Fallback nếu có lỗi
+                self.projects = ["FC", "FSS", "PKT", "WAK", "PPFP"]
+                print(f"[Jira] Lỗi khi lấy projects, dùng mặc định: {', '.join(self.projects)}")
+                self.logger.warning(f"Failed to get all projects: {ex}")
 
     # -----------------------------
     # Low-level helpers
@@ -180,6 +191,24 @@ class JiraClient:
             print(f"[Jira] Ping error: {ex}")
             return False
 
+    def get_all_projects(self) -> List[str]:
+        """Lấy tất cả project keys từ Jira."""
+        try:
+            print("[Jira] Đang lấy danh sách tất cả projects từ Jira...")
+            resp = self._request("GET", "/rest/api/2/project")
+            if resp.status_code != 200:
+                self.logger.warning(f"get_all_projects failed: {resp.status_code} - {resp.text[:200]}")
+                return []
+            projects_data = resp.json()
+            project_keys = [p.get("key", "").upper() for p in projects_data if p.get("key")]
+            project_keys = [p for p in project_keys if p]  # Loại bỏ empty strings
+            print(f"[Jira] Lấy được {len(project_keys)} projects: {', '.join(project_keys)}")
+            return project_keys
+        except Exception as ex:
+            self.logger.warning(f"get_all_projects error: {ex}")
+            print(f"[Jira] Lỗi khi lấy danh sách projects: {ex}")
+            return []
+
     # -----------------------------
     # Public API methods
     # -----------------------------
@@ -196,8 +225,7 @@ class JiraClient:
         """Truy vấn issues bằng JQL (tự động phân trang)."""
         collected: List[Dict[str, Any]] = []
         page = start_at
-        print("[Jira] Bắt đầu tìm kiếm issues theo JQL...")
-        print(f"[Jira] JQL: {jql}")
+
         # =========================
         # OLD PREFLIGHT (đã đóng tạm)
         # Mục đích: gọi thử search 1 issue trước khi chạy vòng lặp chính.
@@ -228,59 +256,116 @@ class JiraClient:
         # - Giả lập/gọi test nhanh với điều kiện search của ticket PPFP-933
         # - Luôn chạy 1 lần trước vòng lặp chính để kiểm tra kết nối/quyền truy cập
         # - Không ảnh hưởng tới kết quả search chính (không sửa 'jql' ban đầu)
-        try:
-            pre_params = {
-                "jql": "key = PPFP-933",  # thêm điều kiện search này: https://reqs.frt.vn/browse/PPFP-933
-                "maxResults": 1,
-                "startAt": 0,
-                "fields": "key,summary,status",
-            }
-            print("[Jira] Preflight (NEW): search PPFP-933 để kiểm tra nhanh")
-            pre_resp = self._request("GET", "/rest/api/2/search", params=pre_params)
-            if pre_resp.status_code == 200:
-                pre_data = pre_resp.json() or {}
-                pre_issues = pre_data.get("issues", [])
-                pre_count = len(pre_issues)
-                pre_key = pre_issues[0]["key"] if pre_count else ""
-                print(f"[Jira] Preflight (NEW) OK: {pre_count} issue(s). First: {pre_key}")
-            else:
-                print(f"[Jira] Preflight (NEW) FAILED: {pre_resp.status_code} - {pre_resp.text[:200]}")
-        except Exception as ex:
-            print(f"[Jira] Preflight (NEW) error: {ex}")
+        
+        # === PHẦN 1: PREFLIGHT TEST (Kiểm tra nhanh trước khi tìm kiếm thực tế) ===
+        # Mục đích: Thực hiện một lần tìm kiếm test với ticket PPFP-933 để kiểm tra:
+        # - Kết nối tới Jira API có hoạt động không
+        # - Xác thực (authentication) có hợp lệ không
+        # - Quyền truy cập API có đủ không
+        # Nếu test này thành công, vòng lặp chính sẽ chạy an toàn hơn
+        #try:
+            ## Chuẩn bị tham số cho request test: tìm ticket PPFP-933
+            #pre_params = {
+                #"jql": "key = PPFP-933",  # thêm điều kiện search này: https://reqs.frt.vn/browse/PPFP-933
+                #"maxResults": 1,          # Chỉ cần 1 kết quả để test
+                #"startAt": 0,              # Bắt đầu từ vị trí 0
+                #"fields": "key,summary,status",  # Chỉ lấy các trường cơ bản
+            #}
+            #print("[Jira] Preflight (NEW): search PPFP-933 để kiểm tra nhanh")
+#            
+            ## Gọi API search để test
+            #pre_resp = self._request("GET", "/rest/api/2/search", params=pre_params)
+#            
+            ## Xử lý kết quả test
+            #if pre_resp.status_code == 200:
+                ## Nếu thành công: parse JSON và đếm số issue tìm được
+                #pre_data = pre_resp.json() or {}
+                #pre_issues = pre_data.get("issues", [])
+                #pre_count = len(pre_issues)
+                #pre_key = pre_issues[0]["key"] if pre_count else ""  # Lấy key của issue đầu tiên (nếu có)
+                #print(f"[Jira] Preflight (NEW) OK: {pre_count} issue(s). First: {pre_key}")
+            #else:
+                ## Nếu thất bại: in ra mã lỗi và một phần response body
+                #print(f"[Jira] Preflight (NEW) FAILED: {pre_resp.status_code} - {pre_resp.text[:200]}")
+        #except Exception as ex:
+            ## Bắt bất kỳ exception nào xảy ra trong quá trình test (network error, JSON parse error, etc.)
+            #print(f"[Jira] Preflight (NEW) error: {ex}")
+        
+        # === PHẦN 2: VÒNG LẶP PHÂN TRANG CHÍNH (Tìm kiếm thực tế với JQL) ===
+        # Mục đích: Thực hiện tìm kiếm issues theo JQL được truyền vào, tự động phân trang
+        # để lấy tất cả kết quả (vì Jira API có giới hạn số lượng kết quả mỗi lần)
         while True:
+            print("[Jira] Bắt đầu tìm kiếm issues theo JQL...")
+            print(f"[Jira] JQL: {jql}")
+            # Chuẩn bị tham số cho request search chính
             params: Dict[str, Any] = {
-                "jql": jql,
-                "maxResults": max_results,
-                "startAt": page,
+                "jql": jql,                    # Câu lệnh JQL để tìm kiếm (do người dùng truyền vào)
+                "maxResults": max_results,     # Số lượng kết quả tối đa mỗi trang (mặc định 1000)
+                "startAt": page,               # Vị trí bắt đầu của trang hiện tại (để phân trang)
             }
+            
+            # Thêm danh sách các trường (fields) cần lấy nếu được chỉ định
+            # Ví dụ: ["summary", "status", "assignee"] -> "summary,status,assignee"
             if fields:
                 params["fields"] = ",".join(fields)
+            
+            # Thêm danh sách các phần mở rộng (expand) nếu được chỉ định
+            # Ví dụ: ["changelog", "renderedFields"] để lấy thêm thông tin chi tiết
             if expand:
                 params["expand"] = ",".join(expand)
 
+            # Ghi log khi bắt đầu search (chỉ lần đầu tiên)
             if show_first_url and page == start_at:
                 self.logger.info("Search API initialized (URL hidden, see curl in debug logs)")
 
+            # In thông tin trang hiện tại (số trang, vị trí bắt đầu, số lượng kết quả)
             print(f"[Jira] Trang {int(page/max_results)+1} (startAt={page}, maxResults={max_results})")
+            
+            # Log full API parameters
+            params_json = json.dumps(params, ensure_ascii=False, indent=2)
+            self.logger.info(f"API parameters: {params_json}")
+            print(f"[Jira] API parameters: {params_json}")
+            self._write_log_file(f"API parameters: {params_json}")
+            
+            # Gọi API search với tham số đã chuẩn bị
             resp = self._request("GET", "/rest/api/2/search", params=params)
+            
+            # Kiểm tra mã trạng thái HTTP
             if resp.status_code != 200:
+                # Nếu không phải 200 (OK): lấy chi tiết lỗi và raise exception
                 details = resp.text.strip() if isinstance(resp.text, str) else ""
                 raise RuntimeError(
                     f"JQL search failed: {resp.status_code} | auth_type={self.auth_type} | verify_ssl={self.session.verify} | body={details[:300]}"
                 )
 
-                
-
+            # === PHẦN 3: XỬ LÝ KẾT QUẢ TỪNG TRANG ===
+            # Parse JSON response từ Jira API
             data = resp.json()
+            
+            # Lấy danh sách issues từ response (mỗi trang có thể có nhiều issues)
             issues = data.get("issues", [])
+            
+            # Thêm tất cả issues của trang hiện tại vào danh sách tổng hợp (collected)
             collected.extend(issues)
 
+            # Lấy tổng số issues phù hợp với JQL (từ Jira API trả về)
             total = data.get("total", 0)
+            
+            # In thông tin: số issues thu được ở trang này và tổng số đã thu được / tổng số có
             print(f"[Jira] Thu được {len(issues)} issue (tổng lũy kế: {len(collected)}/{total})")
+            
+            # === PHẦN 4: ĐIỀU KIỆN DỪNG VÒNG LẶP ===
+            # Dừng vòng lặp nếu:
+            # - Số issues thu được < max_results: không còn trang nào nữa
+            # - Hoặc đã lấy đủ tất cả (page + số issues hiện tại >= tổng số)
             if len(issues) < max_results or page + len(issues) >= total:
                 break
+            
+            # Tăng page lên để lấy trang tiếp theo (di chuyển sang trang sau)
             page += max_results
 
+        # === PHẦN 5: KẾT THÚC ===
+        # In thông tin tổng kết và trả về danh sách tất cả issues đã thu thập được
         print(f"[Jira] Hoàn tất tìm kiếm. Tổng số issue: {len(collected)}")
         return collected
 
@@ -492,15 +577,29 @@ class JiraClient:
     # -----------------------------
     # Convenience for reminder_bot
     # -----------------------------
-    def search_recent_tasks(self, minutes: int) -> List[Dict[str, Any]]:
-        """Tìm tasks cập nhật trong X phút gần đây theo self.projects."""
+    def search_recent_tasks(self, minutes: int, cr_scan_days: int = 3) -> List[Dict[str, Any]]:
+        """Tìm tasks cập nhật trong X phút gần đây hoặc CR tasks trong vòng X ngày.
+        Gộp thành 1 query duy nhất: (tasks updated in minutes) OR (CR tasks updated in cr_scan_days)
+        """
         if self.projects:
             project_values = ", ".join(["'{}'".format(p) for p in self.projects])
             proj_clause = f"project in ({project_values})"
         else:
             proj_clause = ""
-        time_clause = f"updated >= -{int(minutes)}m"
-        jql = " AND ".join([c for c in [proj_clause, time_clause] if c]) + " ORDER BY updated DESC"
+        
+        # Gộp thành 1 query: (tasks updated in minutes) OR (CR tasks updated in cr_scan_days)
+        time_clause_1 = f"updated >= -{int(minutes)}m"
+        #cr_filter = "(issuetype = 'Code Review' OR summary ~ 'CR' OR labels = 'CR')"
+        cr_filter = ""
+        time_clause_2 = f"updated >= -{int(cr_scan_days)}d"
+        contextquery = 'text ~ "test api hangnt60"'
+        # Tạo JQL: project AND time_clause_2 AND contextquery (chỉ lấy time_clause_2)
+        if proj_clause:
+            jql = f"{proj_clause} AND {time_clause_2} AND {contextquery}"
+        else:
+            jql = f"{time_clause_2} AND {contextquery}"
+        jql += " ORDER BY updated DESC"
+        
         fields = [
             "summary",
             "status",
@@ -517,7 +616,16 @@ class JiraClient:
             "statuscategorychangedate",
             "labels",
         ]
-        issues = self.search_issues(jql, fields=fields, expand=None, max_results=200)
+        print(f"[Jira] Query: Tasks updated in last {minutes} minutes OR CR tasks in last {cr_scan_days} days")
+        try:
+            issues = self.search_issues(jql, fields=fields, expand=None, max_results=400)
+            print(f"[Jira] Found {len(issues)} tasks")
+        except Exception as ex:
+            self.logger.warning(f"Failed to search tasks: {ex}")
+            print(f"[Jira] Query failed: {ex}")
+            issues = []
+        
+        # Chuẩn hoá tất cả tasks
         tasks: List[Dict[str, Any]] = []
         for idx, issue in enumerate(issues, 1):
             print(f"[Jira] Chuẩn hoá task {idx}/{len(issues)}: {issue.get('key')}")

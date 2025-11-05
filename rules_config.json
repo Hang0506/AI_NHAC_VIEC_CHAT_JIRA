@@ -1,9 +1,10 @@
- {
-   "check_interval_minutes": 15,
-   "ci_testing_wait_minutes": 60,
-   "pre_version_days": 2,
-   "domains_allowed": ["FRT", "FSOFT"],
-   "resend_after_hours": 8,
-   "assignee_change_wait_minutes": 5
- }
+{
+  "check_interval_minutes": 15,
+  "ci_testing_wait_minutes": 60,
+  "pre_version_days": 2,
+  "domains_allowed": ["FRT", "FSOFT"],
+  "resend_after_hours": 8,
+  "assignee_change_wait_minutes": 5,
+  "cr_scan_days": 3
+}
 
